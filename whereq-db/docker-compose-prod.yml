@@ -1,0 +1,48 @@
+# =============================================================================
+# Shared PostgreSQL instance — whereq infrastructure
+# =============================================================================
+# Serves both flowdesk.top and KeyToMarvel.com (keycloak k2m database).
+# This compose owns the whereq-network — all application composes
+# reference that network as external.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.postgres.yml up -d
+#   docker compose -f docker/docker-compose.postgres.yml down   # never loses data (bind mount)
+#
+# .env keys consumed (all have safe defaults):
+#   POSTGRES_USER            default: flowdesk
+#   POSTGRES_PASSWORD        default: flowdesk
+#   POSTGRES_DB              default: flowdesk
+#   DB_PORT                  default: 5432
+#   POSTGRES_DATA_PATH       default: /home/whereq/docker/postgres/data
+# =============================================================================
+
+networks:
+  db-network:
+    # Pre-existing shared network owned by the cluster — reference it, do not manage it.
+    name: whereq-network
+    external: true
+
+services:
+  db:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: whereq-postgres:17
+    container_name: whereq-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-whereq}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-WhereQ123}
+      POSTGRES_DB: ${POSTGRES_DB:-whereq-com}
+    volumes:
+      - ${POSTGRES_DATA_PATH:-/home/whereq/docker/postgres/data}:/var/lib/postgresql/data
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    networks:
+      - db-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-flowdesk} -d ${POSTGRES_DB:-flowdesk}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

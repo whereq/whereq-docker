@@ -30,6 +30,23 @@ LABEL description="PostgreSQL 17 + PostGIS 3.5 for the shared whereq database cl
 # Cluster bootstrap — runs only on a fresh (empty) data directory.
 COPY init.sql /docker-entrypoint-initdb.d/01-init.sql
 
+# =============================================================================
+# pgvector 0.8.0 — semantic vector type/index for flowdesk.top (NOVA retrieval)
+# Built from SOURCE against this image's /usr/local PostgreSQL. The Alpine apk
+# postgresql-pgvector targets Alpine's /usr postgres (different prefix), not the
+# /usr/local postgres this image uses — same reason PostGIS comes from the
+# imresamu base, not apk. pg is built --with-llvm, so clang19/llvm19-dev are
+# needed to emit the JIT bitcode.
+# =============================================================================
+RUN set -eux; \
+    apk add --no-cache --virtual .pgvector-build build-base clang19 llvm19-dev git; \
+    git clone --depth 1 --branch v0.8.0 https://github.com/pgvector/pgvector.git /tmp/pgvector; \
+    cd /tmp/pgvector; \
+    make; \
+    make install; \
+    cd /; rm -rf /tmp/pgvector; \
+    apk del .pgvector-build
+
 HEALTHCHECK --interval=10s --timeout=5s --retries=5 \
     CMD pg_isready -U "${POSTGRES_USER:-postgres}" || exit 1
 

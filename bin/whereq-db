@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# =============================================================================
+# whereq-db — shared PostgreSQL lifecycle control
+# =============================================================================
+# Canonical, idempotent way to build/run/manage the shared `whereq-db` container
+# across the WhereQ Universe (whereq.com, flowdesk, k2m, catobigato). The SAME
+# script works LOCAL and PROD — only whereq-db/.env differs between hosts.
+#
+# Any app repo can bring the database up with a single call:
+#   ~/git/whereq-docker/bin/whereq-db up
+#
+# Usage:
+#   bin/whereq-db <command> [args]
+#
+# Commands:
+#   up                 Ensure the network + data dir, then create-or-start the
+#                      container and wait until healthy. (idempotent)
+#   down               Stop the container (data preserved).
+#   restart            down + up.
+#   status             Show container state, health, port, and reachability.
+#   logs [-f]          Show (or follow) container logs.
+#   build              Build the whereq-postgres image from ./whereq-db.
+#   psql [args…]       Open psql inside the container as the superuser.
+#   create-app DB ROLE PASSWORD
+#                      Provision an application database + login role (idempotent).
+#   doctor             Diagnose docker engine / image / container / port.
+#   -h | --help        This help.
+#
+# Config comes from whereq-db/.env (copy from whereq-db/.env.example).
+# =============================================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DB_DIR="${REPO_ROOT}/whereq-db"
+
+# shellcheck source=../lib/common.sh
+source "${REPO_ROOT}/lib/common.sh"
+
+# ── Config (defaults ← .env.example, overrides ← .env) ───────────────────────
+wq_load_env "${DB_DIR}/.env.example"
+wq_load_env "${DB_DIR}/.env"
+
+IMAGE="${WHEREQ_DB_IMAGE:-whereq-postgres:17}"
+CONTAINER="${WHEREQ_DB_CONTAINER:-whereq-db}"
+NETWORK="${WHEREQ_NETWORK:-whereq-network}"
+PORT="${WHEREQ_DB_PORT:-5432}"
+DATA="${WHEREQ_DB_DATA:-/home/whereq/docker/postgres/data}"
+PG_USER="${POSTGRES_USER:-flowdesk}"
+PG_DB="${POSTGRES_DB:-flowdesk}"
+PG_PASSWORD="${POSTGRES_PASSWORD:-}"
+
+need_engine() {
+  if ! wq_engine_up; then
+    wq_err "Docker engine not reachable."
+    wq_dim "In this WSL setup, start Docker Desktop (Windows) so the Linux engine is up."
+    exit 1
+  fi
+}
+
+image_exists() { local d; d="$(wq_docker)"; "$d" image inspect "$IMAGE" >/dev/null 2>&1; }
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+cmd_build() {
+  need_engine
+  local d; d="$(wq_docker)"
+  wq_log "Building ${IMAGE} from ${DB_DIR}…"
+  "$d" build -t "$IMAGE" "$DB_DIR"
+  wq_ok "Built ${IMAGE}"
+}
+
+cmd_up() {
+  need_engine
+  local d; d="$(wq_docker)"
+  local state; state="$(wq_container_state "$CONTAINER")"
+
+  case "$state" in
+    running)
+      wq_ok "'${CONTAINER}' already running."
+      ;;
+    stopped)
+      wq_log "Starting existing '${CONTAINER}'…"
+      "$d" start "$CONTAINER" >/dev/null
+      ;;
+    absent)
+      # Fresh create — needs the image, network, data dir, and a real password.
+      image_exists || { wq_warn "Image ${IMAGE} missing — building it first."; cmd_build; }
+      wq_ensure_network "$NETWORK"
+      mkdir -p "$DATA"
+      if [[ -z "$PG_PASSWORD" || "$PG_PASSWORD" == "change-me" ]]; then
+        wq_err "POSTGRES_PASSWORD is not set — required to create the cluster."
+        wq_dim "Copy whereq-db/.env.example → whereq-db/.env and set the superuser password."
+        exit 1
+      fi
+      wq_log "Creating '${CONTAINER}' (${IMAGE}) on '${NETWORK}', port ${PORT}…"
+      "$d" run -d \
+        --name "$CONTAINER" \
+        --network "$NETWORK" \
+        --restart unless-stopped \
+        -p "${PORT}:5432" \
+        -v "${DATA}:/var/lib/postgresql/data" \
+        -e "POSTGRES_USER=${PG_USER}" \
+        -e "POSTGRES_PASSWORD=${PG_PASSWORD}" \
+        -e "POSTGRES_DB=${PG_DB}" \
+        "$IMAGE" >/dev/null
+      ;;
+  esac
+
+  if wq_wait_healthy "$CONTAINER" 40; then
+    wq_ok "'${CONTAINER}' is up and healthy (localhost:${PORT})."
+  else
+    wq_err "'${CONTAINER}' did not become healthy in time. See: bin/whereq-db logs"
+    exit 1
+  fi
+}
+
+cmd_down() {
+  need_engine
+  local d; d="$(wq_docker)"
+  if [[ "$(wq_container_state "$CONTAINER")" == "running" ]]; then
+    wq_log "Stopping '${CONTAINER}'…"
+    "$d" stop "$CONTAINER" >/dev/null
+    wq_ok "Stopped (data preserved on ${DATA})."
+  else
+    wq_dim "'${CONTAINER}' is not running."
+  fi
+}
+
+cmd_status() {
+  local d; d="$(wq_docker)" || { wq_err "No docker binary found."; exit 1; }
+  local state; state="$(wq_container_state "$CONTAINER")"
+  printf '%sContainer:%s %s  (%s)\n' "$WQ_BOLD" "$WQ_NC" "$CONTAINER" "$state"
+  printf '%sImage:%s     %s\n' "$WQ_BOLD" "$WQ_NC" "$IMAGE"
+  printf '%sNetwork:%s   %s\n' "$WQ_BOLD" "$WQ_NC" "$NETWORK"
+  printf '%sData:%s      %s\n' "$WQ_BOLD" "$WQ_NC" "$DATA"
+  printf '%sPort:%s      %s\n' "$WQ_BOLD" "$WQ_NC" "$PORT"
+  if [[ "$state" == "running" ]]; then
+    local health
+    health="$("$d" inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}running{{end}}' "$CONTAINER" 2>/dev/null)"
+    printf '%sHealth:%s    %s\n' "$WQ_BOLD" "$WQ_NC" "$health"
+    if "$d" exec "$CONTAINER" pg_isready -U "$PG_USER" >/dev/null 2>&1; then
+      wq_ok "Accepting connections as '${PG_USER}'."
+    else
+      wq_warn "Container up but pg_isready failed."
+    fi
+  fi
+}
+
+cmd_logs() {
+  need_engine
+  local d; d="$(wq_docker)"
+  if [[ "${1:-}" == "-f" ]]; then "$d" logs -f "$CONTAINER"; else "$d" logs --tail 80 "$CONTAINER"; fi
+}
+
+cmd_psql() {
+  need_engine
+  local d; d="$(wq_docker)"
+  "$d" exec -it "$CONTAINER" psql -U "$PG_USER" "$@"
+}
+
+cmd_create_app() {
+  need_engine
+  local db="${1:-}" role="${2:-}" pw="${3:-}"
+  if [[ -z "$db" || -z "$role" || -z "$pw" ]]; then
+    wq_err "Usage: bin/whereq-db create-app <db> <role> <password>"
+    exit 1
+  fi
+  local d; d="$(wq_docker)"
+  wq_log "Provisioning role '${role}' + database '${db}'…"
+  # Idempotent: create role/db only if absent.
+  "$d" exec -i "$CONTAINER" psql -U "$PG_USER" -d postgres <<SQL
+DO \$\$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${role}') THEN
+    CREATE ROLE ${role} LOGIN PASSWORD '${pw}';
+  END IF;
+END \$\$;
+SELECT 'CREATE DATABASE ${db} OWNER ${role}'
+  WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${db}')\gexec
+SQL
+  wq_ok "Ready: database '${db}' owned by '${role}'."
+}
+
+cmd_doctor() {
+  local d
+  if d="$(wq_docker)"; then
+    if wq_engine_up; then wq_ok "docker: ${d} (engine reachable)"; else wq_warn "docker: ${d} present but engine NOT reachable (start Docker Desktop)"; fi
+  else
+    wq_err "docker: no binary found"
+  fi
+  image_exists && wq_ok "image ${IMAGE}: present" || wq_warn "image ${IMAGE}: missing (run: bin/whereq-db build)"
+  wq_dim "container state: $(wq_container_state "$CONTAINER")"
+  [[ -d "$DATA" ]] && wq_ok "data dir ${DATA}: exists" || wq_warn "data dir ${DATA}: absent (created on first 'up')"
+  [[ -f "${DB_DIR}/.env" ]] && wq_ok ".env: present" || wq_dim ".env: not set (using .env.example defaults)"
+}
+
+usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+# ── Dispatch ─────────────────────────────────────────────────────────────────
+cmd="${1:-up}"; shift || true
+case "$cmd" in
+  up)         cmd_up ;;
+  down)       cmd_down ;;
+  restart)    cmd_down; cmd_up ;;
+  status)     cmd_status ;;
+  logs)       cmd_logs "$@" ;;
+  build)      cmd_build ;;
+  psql)       cmd_psql "$@" ;;
+  create-app) cmd_create_app "$@" ;;
+  doctor)     cmd_doctor ;;
+  -h|--help)  usage ;;
+  *)          wq_err "Unknown command: ${cmd}"; usage; exit 1 ;;
+esac

@@ -1,0 +1,43 @@
+services:
+  ollama:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Override these if you want different model tags.
+        MODEL_1B: gemma3:1b
+        MODEL_3B: llama3.2:3b
+        MODEL_7B: qwen3:8b
+    image: whereq/ollama-1b-3b-7b:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    environment:
+      # Bind to all interfaces inside the container so the published port works.
+      OLLAMA_HOST: 0.0.0.0:11434
+      # Keep loaded models warm in VRAM for a day between requests.
+      OLLAMA_KEEP_ALIVE: 24h
+      # Uncomment to limit which GPUs Ollama may use (multi-GPU hosts).
+      # OLLAMA_NUM_GPU: "1"
+    volumes:
+      # Persist downloaded models across rebuilds.
+      - ollama_data:/root/.ollama
+    # If you have an NVIDIA GPU and the nvidia-container-toolkit installed:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:11434/api/tags"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  ollama_data:
+    name: ollama_data

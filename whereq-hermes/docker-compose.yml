@@ -1,0 +1,44 @@
+services:
+  hermes:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Pin or override the Hermes version / UID here.
+      args:
+        HERMES_VERSION: v2026.6.5
+        HERMES_UID: "10000"
+    image: whereq/hermes-agent:latest
+    container_name: hermes
+    restart: unless-stopped
+    # Run the interactive CLI by default. For batch/non-interactive use,
+    # override with: docker compose run --rm hermes hermes-agent "your prompt"
+    stdin_open: true
+    tty: true
+    environment:
+      # API key for the model provider. Put your real key in a .env file
+      # and uncomment the `env_file` line below.
+      # OPENAI_API_KEY: ${OPENAI_API_KEY}
+      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      TERM: xterm-256color
+    env_file:
+      - .env
+    volumes:
+      # Persist Hermes home (sessions, memories, skills you author at runtime)
+      - hermes_home:/home/hermes/.hermes
+      # Mount the whereq-ollama sidecar's port as a model backend.
+      # Requires the `ollama` compose service to be on the same network
+      # (uncomment the `networks:` block below if running both stacks).
+      # - /var/run/docker.sock:/var/run/docker.sock  # only if you want
+      #   hermes to be able to spawn sibling containers via the docker CLI
+    # networks:
+    #   - ollama_net
+
+# volumes:
+#   hermes_home:
+#     name: hermes_home
+
+# networks:
+#   ollama_net:
+#     external: true
+#     name: whereq-ollama_default   # the default network created by the
+#                                  # whereq-ollama docker compose project

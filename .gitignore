@@ -1,0 +1,7 @@
+# Per-host runtime config with real values — keep .env.example templates only.
+**/.env
+!**/.env.example
+
+# Machine-local Claude Code permissions (absolute paths, personal allowlists).
+# The shareable variant is .claude/settings.json.
+**/.claude/settings.local.json

@@ -1,0 +1,8 @@
+# Keep the build context tiny: only what the Dockerfile actually COPYs.
+*
+!Dockerfile
+!requirements/
+!docker-entrypoint.sh
+!llm-doctor.sh
+!dedupe-binaries.sh
+!providers/

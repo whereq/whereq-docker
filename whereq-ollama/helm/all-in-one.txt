@@ -1,0 +1,429 @@
+Chart.yaml
+apiVersion: v2
+name: hermes
+description: Hermes agent with local Ollama as LLM provider (no messaging providers)
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+values.yaml
+# -- Image
+image:
+  repository: registry.kube.dp.ist.bns/dp-hermes
+  tag: v1.0.0
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: "hermes"
+
+replicaCount: 1
+
+serviceAccount:
+  create: true
+  name: ""
+
+# -- Hermes runtime config
+hermes:
+  # Gateway / dashboard bind address inside the pod
+  gatewayEndpoint: "0.0.0.0:8642"
+  dashboardPort: 8642
+  logLevel: "INFO"
+
+  # LLM provider: in-cluster Ollama
+  llm:
+    provider: "openai"   # Ollama exposes an OpenAI-compatible API at /v1
+    baseUrl: "http://ollama.ollama.svc.cluster.local:11434/v1"
+    model: "qwen3:8b"    # change to whichever model you've pulled in ollama
+    # Ollama doesn't require a real key, but the OpenAI client lib insists on one
+    apiKey: "ollama"
+
+  # Messaging providers — all disabled at first
+  providers:
+    slack:    { enabled: false }
+    discord:  { enabled: false }
+    telegram: { enabled: false }
+    matrix:   { enabled: false }
+
+# -- Service for the dashboard UI
+service:
+  type: ClusterIP
+  port: 8642
+  # set to NodePort or LoadBalancer if you don't want to use the ingress
+  # nodePort: 30864
+
+# -- Ingress for the dashboard
+ingress:
+  enabled: true
+  className: "nginx"
+  host: hermes.kube.dp.dev.bns
+  path: /
+  pathType: Prefix
+  tls:
+    enabled: true
+    secretName: hermes-tls
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    nginx.ingress.kubernetes.io/proxy-body-size: "20m"
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+  limits:
+    cpu: "2"
+    memory: "4Gi"
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podSecurityContext:
+  fsGroup: 1000
+securityContext: {}
+
+# Pod-level extras
+podAnnotations: {}
+terminationGracePeriodSeconds: 30
+
+# Probe tuning — defaults are tuned to survive the slow s6 chown of /opt/hermes
+probes:
+  startup:
+    periodSeconds: 10
+    failureThreshold: 90      # up to ~15 minutes on first boot
+    timeoutSeconds: 3
+  readiness:
+    periodSeconds: 10
+    failureThreshold: 3
+    timeoutSeconds: 3
+  liveness:
+    periodSeconds: 30
+    failureThreshold: 5
+    timeoutSeconds: 3
+
+# Dynatrace OneAgent injection. The LD_PRELOAD wrapper roughly doubles syscall
+# latency, which makes the recursive chown during s6 init painfully slow.
+# Disable here unless platform team requires APM on this workload.
+dynatrace:
+  enabled: false
+
+# -- Persistence for chat history / vector store / cache
+persistence:
+  enabled: true
+  storageClass: "longhorn"   # change to a storageclass you saw in `kubectl get sc`
+  accessModes: ["ReadWriteOnce"]
+  size: 10Gi
+  mountPath: /app/data
+  
+  fixPermissions: true
+  fixPermissionsImage: "busybox:1.36"
+  
+# Optional escape hatches for extra mounts (e.g. CA bundles, extra configs)
+extraVolumes: []
+extraVolumeMounts: []
+
+_helpers.tpl
+{{- define "hermes.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "hermes.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name (include "hermes.name" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "hermes.labels" -}}
+app.kubernetes.io/name: {{ include "hermes.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
+{{- end -}}
+
+{{- define "hermes.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "hermes.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{- define "hermes.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create -}}
+{{- default (include "hermes.fullname" .) .Values.serviceAccount.name -}}
+{{- else -}}
+{{- default "default" .Values.serviceAccount.name -}}
+{{- end -}}
+{{- end -}}
+
+configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hermes.fullname" . }}-config
+  labels:
+    {{- include "hermes.labels" . | nindent 4 }}
+data:
+  # s6-overlay: drop privileges to this user after init
+  PUID: "1000"
+  PGID: "1000"
+  S6_KEEP_ENV: "1"
+  HERMES_GATEWAY_ENDPOINT: {{ .Values.hermes.gatewayEndpoint | quote }}
+  HERMES_LOG_LEVEL: {{ .Values.hermes.logLevel | quote }}
+
+  # LLM (Ollama via OpenAI-compatible API)
+  OPENAI_BASE_URL: {{ .Values.hermes.llm.baseUrl | quote }}
+  OPENAI_API_BASE: {{ .Values.hermes.llm.baseUrl | quote }}   # some libs read this name
+  OPENAI_MODEL:    {{ .Values.hermes.llm.model   | quote }}
+  LLM_PROVIDER:    {{ .Values.hermes.llm.provider | quote }}
+
+  # Disable all messaging providers
+  SLACK_ENABLED:    {{ .Values.hermes.providers.slack.enabled    | quote }}
+  DISCORD_ENABLED:  {{ .Values.hermes.providers.discord.enabled  | quote }}
+  TELEGRAM_ENABLED: {{ .Values.hermes.providers.telegram.enabled | quote }}
+  MATRIX_ENABLED:   {{ .Values.hermes.providers.matrix.enabled   | quote }}
+
+deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hermes.fullname" . }}
+  labels:
+    {{- include "hermes.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "hermes.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hermes.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Roll the pods if config/secret content changes
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- if not .Values.dynatrace.enabled }}
+        # Opt out of Dynatrace OneAgent injection (LD_PRELOAD wrapper slows down s6 init)
+        dynakube.dynatrace.com/inject: "false"
+        oneagent.dynatrace.com/inject: "false"
+        metadata-enrichment.dynatrace.com/inject: "false"
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "hermes.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if and .Values.persistence.enabled .Values.persistence.fixPermissions }}
+      initContainers:
+        - name: fix-data-perms
+          image: {{ .Values.persistence.fixPermissionsImage | default "busybox:1.36" }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "Fixing ownership of {{ .Values.persistence.mountPath }} to 1000:1000"
+              chown -R 1000:1000 {{ .Values.persistence.mountPath }} || true
+              chmod -R u+rwX,g+rwX {{ .Values.persistence.mountPath }} || true
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+      {{- end }}
+      containers:
+        - name: hermes
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.securityContext }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- end }}
+          # NOTE: do NOT override command/args.
+          # The image entrypoint (s6-overlay) starts the gateway itself; CLI flags like
+          # --host/--port/--insecure are not recognized by the entrypoint.
+          envFrom:
+            - configMapRef:
+                name: {{ include "hermes.fullname" . }}-config
+            - secretRef:
+                name: {{ include "hermes.fullname" . }}-env
+          ports:
+            - name: http
+              containerPort: {{ .Values.hermes.dashboardPort }}
+              protocol: TCP
+          # ---- Probes ----
+          # A startupProbe gates liveness/readiness so s6-overlay has plenty of time
+          # to run the recursive chown of /opt/hermes during first boot.
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: {{ .Values.probes.startup.periodSeconds | default 10 }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold | default 90 }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds | default 3 }}
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds | default 10 }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold | default 3 }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds | default 3 }}
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds | default 30 }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold | default 5 }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds | default 3 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: run
+              mountPath: /run
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        {{- if .Values.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "hermes.fullname" . }}-data
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 30 }}
+
+ingress.yaml
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "hermes.fullname" . }}
+  labels:
+    {{- include "hermes.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ .Values.ingress.tls.secretName | quote }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.path }}
+            pathType: {{ .Values.ingress.pathType }}
+            backend:
+              service:
+                name: {{ include "hermes.fullname" . }}
+                port:
+                  number: {{ .Values.service.port }}
+{{- end }}
+
+pvc.yaml
+{{- if .Values.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "hermes.fullname" . }}-data
+  labels:
+    {{- include "hermes.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- range .Values.persistence.accessModes }}
+    - {{ . | quote }}
+    {{- end }}
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size | quote }}
+{{- end }}
+
+secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "hermes.fullname" . }}-env
+  labels:
+    {{- include "hermes.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  # Ollama doesn't need a real key, but the OpenAI client requires the var to be set
+  OPENAI_API_KEY: {{ .Values.hermes.llm.apiKey | quote }}
+
+
+service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hermes.fullname" . }}
+  labels:
+    {{- include "hermes.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort }}
+      nodePort: {{ .Values.service.nodePort }}
+      {{- end }}
+  selector:
+    {{- include "hermes.selectorLabels" . | nindent 4 }}
+
+serviceaccount.yaml
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "hermes.serviceAccountName" . }}
+  labels:
+    {{- include "hermes.labels" . | nindent 4 }}
+{{- end }}

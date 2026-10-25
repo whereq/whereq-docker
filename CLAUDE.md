@@ -1,0 +1,88 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this repo is
+
+Docker image definitions **and shared lifecycle scripts** for the WhereQ Universe (whereq.com, flowdesk.top, KeyToMarvel/k2m, catobigato, chroniq, whereq-monitor, and the ccbus/buzz stack). Each top-level directory is a self-contained image: a Dockerfile, usually a `docker-compose.yml`, and a README — there is no root README. There is no shared build system, no tests, and no lint — verification means building the image and running the container.
+
+**Memory hierarchy:** this file holds what is shared across all images. `whereq-llm-cli/CLAUDE.md` is a nested, image-specific file that is authoritative for that image and deliberately does **not** repeat anything from here — when working inside `whereq-llm-cli/`, read both, and prefer the nested file for image-specific questions.
+
+## Shared scripts (`bin/` + `lib/`)
+
+- **`lib/common.sh`** — a sourced Bash library reused by every control script and by application repos' own dev scripts. It centralises the WSL **docker-vs-docker.exe** quirk (`wq_docker` picks whichever binary actually reaches an engine), plus `wq_engine_up`, `wq_load_env`, `wq_ensure_network`, `wq_container_state`, `wq_wait_healthy`, and `wq_log/ok/warn/err/dim`. Source it: `source ~/git/whereq-docker/lib/common.sh`.
+- **`bin/whereq-db`** — canonical, idempotent lifecycle for the shared `whereq-db` container (`up`/`down`/`restart`/`status`/`logs`/`build`/`psql`/`create-app`/`doctor`). The **same script serves local and prod** — only `whereq-db/.env` differs per host. This is the single source of truth for bringing the database up; application repos delegate to it (e.g. catobigato's `bin/dev.sh` calls `bin/whereq-db up`). Config comes from `whereq-db/.env` (copy from `whereq-db/.env.example`; `.env` is gitignored). Two script-internal couplings: no argument means `up`, and `--help` prints `sed -n '2,40p'` of the script itself — the header comment must stay inside that line range or the help text truncates.
+
+New shared services follow the same pattern: add `bin/whereq-<svc>` that sources `lib/common.sh` and reads `<svc>/.env`.
+
+## Commands
+
+Each image builds independently with its directory as the build context:
+
+```bash
+# Compose-managed images (whereq-hermes, whereq-ollama)
+cd whereq-hermes && docker compose build        # or: docker compose up -d --build
+
+# whereq-llm-cli: copy .env.example to .env first (set LLM_PROVIDER + WQ_API_KEY)
+cd whereq-llm-cli && docker compose build
+docker compose run --rm llm-cli                 # interactive shell
+docker compose run --rm llm-cli claude          # launch a specific CLI
+docker compose run --rm llm-cli llm-doctor      # what's installed, is it wired up
+
+# whereq-db: use the lifecycle script (build + run + manage) — not raw docker
+bin/whereq-db build      # build whereq-postgres:17
+bin/whereq-db up         # create-or-start the container (idempotent, local & prod)
+bin/whereq-db status     # state / health / reachability
+```
+
+Version pins live in build args (`HERMES_VERSION`, `OLLAMA_VERSION`, `MODEL_1B/3B/7B`, and in `whereq-llm-cli` also `NODE_VERSION`, `PYTHON_VERSION`, `UV_VERSION`, `CLAUDE_CODE_VERSION`, `CODEX_VERSION`, `COPILOT_VERSION`) declared in both the Dockerfile and the compose `build.args` — keep the two in sync when bumping.
+
+Verification is manual and out-of-band: build the image and run the container. The only local check available for shell changes is a syntax pass — `bash -n bin/whereq-db lib/common.sh`, and `bash -n docker-entrypoint.sh llm-doctor.sh dedupe-binaries.sh` inside `whereq-llm-cli/` (the scripts carry `# shellcheck` directives, but shellcheck is not installed here).
+
+## Images and their non-obvious constraints
+
+**whereq-db** — shared PostgreSQL 17 + PostGIS 3.5 cluster serving multiple apps. The base image choice (`imresamu/postgis:17-3.5-alpine`, not official `postgres` + apk postgis) is load-bearing: the official Alpine postgres lives in `/usr/local` so Alpine's apk postgis package never links against it, the Alpine postgres uid (70) matches the existing host data dir, and the PROD host is arm64 which `postgis/postgis` doesn't publish. `init.sql` runs only against a fresh/empty data directory (cluster-wide extensions only); per-database extensions like PostGIS belong in each application's own migrations. Data is on a host bind mount, so rebuilds never lose data.
+
+**whereq-hermes** — Hermes Agent (Nous Research) built from a GitHub release tag via a multi-stage uv build (wheel in builder, pip install in slim runtime, non-root `hermes` user, tini as PID 1). The Python 3.13 / `<3.14` cap comes from upstream's pyproject and is load-bearing (Rust-backed deps lack cp314 wheels). Three entry points ship: `hermes` (interactive, the default CMD), `hermes-agent` (batch), `hermes-acp` (editor adapter). `HERMES_UID` (default 10000) must match the host UID when `/home/hermes` is bind-mounted. Compose gotchas: `env_file: - .env` is mandatory and no `.env.example` ships in this directory, so `docker compose up/run` fails until you create one; the top-level `volumes:` and `networks:` blocks are commented out and must be uncommented alongside the service's `networks:`/`volumes:` entries.
+
+**whereq-ollama** — Ollama server with 1B/3B/7B-class models baked into the image at build time: a `model-bake` stage starts `ollama serve` in the background, pulls the models sequentially (to avoid OOM), and the runtime stage copies the populated `/root/.ollama` store. First build downloads ~10–15 GB. `helm/all-in-one.txt` is a reference dump of a Helm chart for running Hermes + Ollama on Kubernetes, not part of the Docker build.
+
+**whereq-ollama-mistral7b** — same `model-bake`/runtime pattern as `whereq-ollama`, but pins all three tiers to non-Chinese models (`gemma3:1b`, `llama3.2:3b`, `mistral:7b`) — the 7B choice is deliberate: Qwen/DeepSeek/Yi/GLM are Chinese-origin, Llama's smallest dense tier is 8B, so Mistral 7B is the lightest well-supported non-Chinese 7B. Swap tiers via `MODEL_1B`/`MODEL_3B`/`MODEL_7B` build args.
+
+**The two Ollama images are alternatives, not a fleet**: both compose files publish host port `11434` and mount `/root/.ollama`, so only one can run per host — change `ports:` before starting the other. They are separate because each bakes a different model set into its own image.
+
+**whereq-llm-cli** — portable toolbox image bundling **three** agentic CLIs (Claude Code, Codex, Copilot) on Node LTS + CPython 3.15 from `python-build-standalone`, so a CLI can clone a repo, write and run a throwaway script, and commit without installing anything at runtime. Two stages, **amd64 only**, 70 pinned Python packages (176 distributions installed), current image **4.91 GB** uncompressed. **It has its own `whereq-llm-cli/CLAUDE.md` — that file is authoritative for this image; read it before changing anything here.** Non-obvious constraints, all of them learned by building it:
+
+- Gemini CLI, Qwen Code, opencode, Crush, Goose, aider and aichat were **deliberately dropped** to keep the image scoped to the three CLIs actually in use — the old 7.2 GB / 1.8 GB compressed size and the aider venv are gone. `whereq-llm-cli/CLAUDE.md` and its `README.md` say "see git history" to resurrect one, but the directory is still untracked in git, so there is no history for it — the dropped components have to be re-added from scratch.
+- The npm CLIs must install in **one** `npm install` — splitting them across layers makes each install prune the others, because npm treats `--prefix` as its project and removes "extraneous" packages. This stays relevant when adding a fourth CLI.
+- The builder stage needs `PATH=/opt/node/bin` explicitly; the runtime `ENV PATH` does not apply to the builder, and `npm` is simply not found without it.
+- `ubuntu:26.04` ships a stock `ubuntu` user at uid/gid 1000 — it must be deleted (or renamed) before the runtime user can take those ids.
+- Never `chown -R /opt` in the runtime stage: overlayfs copies every file up into a second layer (6.4 GB). Hand the toolchains to the runtime uid **in the builder** instead; `COPY` preserves the ownership.
+- Claude Code's postinstall copies its native binary into the package's `bin/` — a second byte-identical copy (280 MB). `dedupe-binaries.sh` swaps it for a symlink by content hash; it currently handles only `@anthropic-ai/claude-code/bin/claude.exe`.
+- On Debian/Ubuntu the binaries are `fdfind` and `batcat`; symlink them to `fd` and `bat`.
+- The entrypoint drops privileges *before* loading the provider config, otherwise the re-exec prints every message twice. It only `chown`s `/config` and `/workspace` when they are **still root-owned** — chowning a directory that already belongs to the host user would silently change ownership on the host side.
+- `tini` is PID 1 (these CLIs spawn process trees: MCP servers, shells, git) and `setpriv` does the privilege drop.
+- `litellm` is deliberately absent from the base Python stack: it pins `openai<3` and `huggingface-hub<2`, which would drag the LLM SDKs a major version back. Add it via `--build-arg PYTHON_EXTRAS=litellm`.
+- `.dockerignore` is an allowlist (`*` plus explicit `!` entries) so the build context stays tiny.
+
+The entrypoint fans one canonical triple (`WQ_API_KEY` / `WQ_BASE_URL` / `WQ_MODEL`) onto each CLI's own env var names, loading a profile from `/etc/llm/providers/<name>.env` (shadowed by `/config/providers/`). DeepSeek and MiniMax speak Anthropic's protocol on a *different* path than their OpenAI-compatible one, so their profiles also set `WQ_ANTHROPIC_BASE_URL`, which only affects `ANTHROPIC_BASE_URL`. All state lives under `/config`; `/workspace` is the code and the CLI's working directory.
+
+## Cross-stack wiring
+
+The hermes and ollama stacks are separate compose projects. To let Hermes use the local Ollama, uncomment the `networks:` block in `whereq-hermes/docker-compose.yml` (it joins the external `whereq-ollama_default` network) and set `OLLAMA_HOST: http://ollama:11434`.
+
+## Cloudflare tunnels (PROD)
+
+`cloudflare/README.md` is the infra design doc for how the WhereQ Universe exposes services on the PROD host ("mini server") via Cloudflare Tunnels — not part of the Docker build, but read it before changing anything tunnel- or ingress-related. Key facts it establishes:
+
+- **Two Cloudflare accounts, two tunnels, two connector processes** (irreducible — one connector = one tunnel = one account). The whereq-family tunnel runs as a **host systemd service** (`cloudflared.service`) and reaches apps via `http://localhost:<host-port>`; it cannot use container names. The ccbus tunnel (currently just `buzz-api`) runs as a **Docker container inside buzz's own compose**, on `whereq-network`, and routes by container name.
+- Ingress (hostname → service) is configured entirely in each account's **Cloudflare Zero Trust dashboard** — there is no local `config.yml` and no tunnel ID/token committed to this repo.
+- To expose a new whereq-family app: publish a host port on its frontend (the `808x` convention, next free is **8084** per the port registry at the bottom of the doc), add a Public Hostname in the whereq dashboard pointing at `http://localhost:<port>`, and register the URL with Keycloak (realm `flowdesk.top`, client `flowdesk-spa`) if it's an SPA.
+
+**Architecture constraints on the PROD host.** The PROD mini server is **arm64**. `whereq-llm-cli` is **amd64-only** (no `TARGETARCH` resolution in its Dockerfile), so it cannot run on PROD as it stands — re-add arch resolution there first if that changes. `whereq-db`'s base image choice (`imresamu/postgis:17-3.5-alpine`) is likewise arm64-driven, because `postgis/postgis` publishes no arm64 build.
+
+## Repo state
+
+Most of the tree is still untracked in git — only `whereq-db/Dockerfile`, `whereq-db/init.sql`, and `cloudflare/README.md` are committed, and the old ASCII-art root `README.md` is deleted in the working tree. Don't read git history as a description of the current layout, and check `git status` before assuming a file is versioned.
+
+In particular `whereq-llm-cli/` is **entirely untracked** — including its own `CLAUDE.md`. Anything that says "see git history" about that directory (its `README.md` and `CLAUDE.md` both do, about the dropped Gemini/Qwen/opencode/Crush/Goose/aider/aichat CLIs) has no history to point at; those components must be re-added from scratch rather than reverted.

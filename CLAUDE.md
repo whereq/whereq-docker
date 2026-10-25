@@ -27,6 +27,7 @@ cd whereq-hermes && docker compose build        # or: docker compose up -d --bui
 cd whereq-llm-cli && docker compose build
 docker compose run --rm llm-cli                 # interactive shell
 docker compose run --rm llm-cli claude          # launch a specific CLI
+docker compose run --rm llm-cli hermes          # Hermes Agent
 docker compose run --rm llm-cli llm-doctor      # what's installed, is it wired up
 
 # whereq-db: use the lifecycle script (build + run + manage) — not raw docker
@@ -35,7 +36,7 @@ bin/whereq-db up         # create-or-start the container (idempotent, local & pr
 bin/whereq-db status     # state / health / reachability
 ```
 
-Version pins live in build args (`HERMES_VERSION`, `OLLAMA_VERSION`, `MODEL_1B/3B/7B`, and in `whereq-llm-cli` also `NODE_VERSION`, `PYTHON_VERSION`, `UV_VERSION`, `CLAUDE_CODE_VERSION`, `CODEX_VERSION`, `COPILOT_VERSION`) declared in both the Dockerfile and the compose `build.args` — keep the two in sync when bumping.
+Version pins live in build args (`HERMES_VERSION`, `OLLAMA_VERSION`, `MODEL_1B/3B/7B`, and in `whereq-llm-cli` also `NODE_VERSION`, `PYTHON_VERSION`, `UV_VERSION`, `CLAUDE_CODE_VERSION`, `CODEX_VERSION`, `COPILOT_VERSION`, and for the bundled Hermes Agent `HERMES_VERSION`, `HERMES_PYTHON_VERSION`, `HERMES_COMMIT`) declared in both the Dockerfile and the compose `build.args` — keep the two in sync when bumping. Note `HERMES_VERSION` means two different things: the standalone `whereq-hermes` image (a `v2026.*` date tag) and the copy bundled in `whereq-llm-cli` (a `v0.*` semver release tag).
 
 Verification is manual and out-of-band: build the image and run the container. The only local check available for shell changes is a syntax pass — `bash -n bin/whereq-db lib/common.sh`, and `bash -n docker-entrypoint.sh llm-doctor.sh dedupe-binaries.sh` inside `whereq-llm-cli/` (the scripts carry `# shellcheck` directives, but shellcheck is not installed here).
 
@@ -53,10 +54,14 @@ Verification is manual and out-of-band: build the image and run the container. T
 
 **The two Ollama images are alternatives, not a fleet**: both compose files publish host port `11434` and mount `/root/.ollama`, so only one can run per host — change `ports:` before starting the other. They are separate because each bakes a different model set into its own image.
 
-**whereq-llm-cli** — portable toolbox image bundling **three** agentic CLIs (Claude Code, Codex, Copilot) on Node LTS + CPython 3.15 from `python-build-standalone`, so a CLI can clone a repo, write and run a throwaway script, and commit without installing anything at runtime. Two stages, **amd64 only**, 70 pinned Python packages (176 distributions installed), current image **4.91 GB** uncompressed. **It has its own `whereq-llm-cli/CLAUDE.md` — that file is authoritative for this image; read it before changing anything here.** Non-obvious constraints, all of them learned by building it:
+**whereq-llm-cli** — portable toolbox image bundling **four** agentic CLIs (Claude Code, Codex, Copilot, Hermes Agent) on Node LTS + CPython 3.15 from `python-build-standalone`, so a CLI can clone a repo, write and run a throwaway script, and commit without installing anything at runtime. Two stages, **amd64 only**, 70 pinned Python packages (176 distributions installed), current image **5.65 GB** uncompressed (4.91 GB with `INSTALL_HERMES=0`). **It has its own `whereq-llm-cli/CLAUDE.md` — that file is authoritative for this image; read it before changing anything here.** Non-obvious constraints, all of them learned by building it:
 
-- Gemini CLI, Qwen Code, opencode, Crush, Goose, aider and aichat were **deliberately dropped** to keep the image scoped to the three CLIs actually in use — the old 7.2 GB / 1.8 GB compressed size and the aider venv are gone. `whereq-llm-cli/CLAUDE.md` and its `README.md` say "see git history" to resurrect one, but the directory is still untracked in git, so there is no history for it — the dropped components have to be re-added from scratch.
+- Gemini CLI, Qwen Code, opencode, Crush, Goose, aider and aichat were **deliberately dropped** to keep the image scoped to the CLIs actually in use — the old 7.2 GB / 1.8 GB compressed size and the aider venv are gone. `whereq-llm-cli/CLAUDE.md` and its `README.md` say "see git history" to resurrect one, but the directory is still untracked in git, so there is no history for it — the dropped components have to be re-added from scratch.
 - The npm CLIs must install in **one** `npm install` — splitting them across layers makes each install prune the others, because npm treats `--prefix` as its project and removes "extraneous" packages. This stays relevant when adding a fourth CLI.
+- **Hermes Agent is the exception to that rule** — it is a Python package installed from a **source checkout**, because upstream blocks wheel/sdist builds outside Nix and publishes no prebuilt artifacts. The build does an editable install (`uv sync --frozen` against the shipped `uv.lock`) at `/opt/hermes`; a wheel would also silently drop the bundled assets (locales, skills, plugin manifests).
+- **Hermes needs its own CPython 3.14** (`/opt/python314`) — upstream pins `requires-python <3.15` and gates every direct dependency behind `python_version >= '3.14'`, because 3.14 is the newest CPython its Rust-backed deps ship wheels for. Its venv (`/opt/hermes/.venv`) is deliberately **off** `PATH` so `python3` still means the shared 3.15 for every other tool; only the three console scripts are symlinked into `/usr/local/bin`.
+- **All Hermes state lives in `/config/hermes`** via `HERMES_HOME` — the default profile's memories, skills, sessions, logs, `state.db`, plus one directory per named profile under `profiles/<name>/`. `HERMES_HOME` is honoured completely: with it set, Hermes never creates `~/.hermes`. The `~/.hermes` symlink only covers the native-home fallback.
+- Hermes writes per-profile launcher shims into `~/.local/bin` when a profile is created, so the whole `~/.local` tree is symlinked to `/config/.local` and `/config/.local/bin` is on `PATH` — the shims survive a container recreate.
 - The builder stage needs `PATH=/opt/node/bin` explicitly; the runtime `ENV PATH` does not apply to the builder, and `npm` is simply not found without it.
 - `ubuntu:26.04` ships a stock `ubuntu` user at uid/gid 1000 — it must be deleted (or renamed) before the runtime user can take those ids.
 - Never `chown -R /opt` in the runtime stage: overlayfs copies every file up into a second layer (6.4 GB). Hand the toolchains to the runtime uid **in the builder** instead; `COPY` preserves the ownership.
@@ -66,7 +71,7 @@ Verification is manual and out-of-band: build the image and run the container. T
 - `tini` is PID 1 (these CLIs spawn process trees: MCP servers, shells, git) and `setpriv` does the privilege drop.
 - `litellm` is deliberately absent from the base Python stack: it pins `openai<3` and `huggingface-hub<2`, which would drag the LLM SDKs a major version back. Add it via `--build-arg PYTHON_EXTRAS=litellm`.
 - `.dockerignore` is an allowlist (`*` plus explicit `!` entries) so the build context stays tiny.
-- The image is **published publicly on Docker Hub** as `whereq/llm-cli:latest` and `whereq/llm-cli:v1.0.0` (same image, digest `sha256:f0eb7c2b8d44…`, 1.28 GB compressed / 4.91 GB uncompressed, `linux/amd64` only). `docker pull` it rather than building, when the local build is not needed.
+- The image is **published publicly on Docker Hub** as `whereq/llm-cli:latest` and `whereq/llm-cli:v1.0.0` (same image, digest `sha256:f0eb7c2b8d44…`, 1.28 GB compressed / 4.91 GB uncompressed, `linux/amd64` only). `docker pull` it rather than building, when the local build is not needed. **The published image predates the Hermes integration** — it needs a rebuild and a re-push.
 
 The entrypoint fans one canonical triple (`WQ_API_KEY` / `WQ_BASE_URL` / `WQ_MODEL`) onto each CLI's own env var names, loading a profile from `/etc/llm/providers/<name>.env` (shadowed by `/config/providers/`). DeepSeek and MiniMax speak Anthropic's protocol on a *different* path than their OpenAI-compatible one, so their profiles also set `WQ_ANTHROPIC_BASE_URL`, which only affects `ANTHROPIC_BASE_URL`. All state lives under `/config`; `/workspace` is the code and the CLI's working directory.
 

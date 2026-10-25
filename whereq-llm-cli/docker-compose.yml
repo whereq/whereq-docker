@@ -23,7 +23,11 @@ services:
         CLAUDE_CODE_VERSION: "2.1.309"
         CODEX_VERSION: "0.163.0"
         COPILOT_VERSION: "1.0.103"
+        # Hermes Agent (Nous Research) — brings its own CPython 3.14.
+        HERMES_VERSION: "v0.22.5"
+        HERMES_PYTHON_VERSION: "3.14.9"
         # Trim the image: any of these to 0 drops that component entirely.
+        INSTALL_HERMES: "1"            # Hermes Agent + its own Python 3.14
         INSTALL_MEDIA: "1"             # ffmpeg + imagemagick
         INSTALL_BUILD_TOOLS: "1"      # gcc/make, so `pip install` works live
         # Match your host user so bind-mounted files stay writable:

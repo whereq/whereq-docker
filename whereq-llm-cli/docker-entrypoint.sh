@@ -100,6 +100,16 @@ if [ -n "${WQ_MODEL:-}" ]; then
   export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-$WQ_MODEL}"
   export OPENAI_MODEL="${OPENAI_MODEL:-$WQ_MODEL}"
   export GEMINI_MODEL="${GEMINI_MODEL:-$WQ_MODEL}"
+  # Hermes picks its default model from HERMES_MODEL.
+  export HERMES_MODEL="${HERMES_MODEL:-$WQ_MODEL}"
+fi
+
+# Hermes reaches a local Ollama through OLLAMA_HOST (it does its own model
+# discovery there), not through the OpenAI-compatible WQ_BASE_URL path.
+# OLLAMA_HOST wants the bare host:port, so the /v1 suffix is stripped.
+if [ "${provider:-}" = "ollama" ]; then
+  export OLLAMA_HOST="${OLLAMA_HOST:-${WQ_BASE_URL:-}}"
+  export OLLAMA_HOST="${OLLAMA_HOST%/v1}"
 fi
 
 # Credential warnings — never print the value, only whether one is present.

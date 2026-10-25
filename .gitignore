@@ -5,3 +5,8 @@
 # Machine-local Claude Code permissions (absolute paths, personal allowlists).
 # The shareable variant is .claude/settings.json.
 **/.claude/settings.local.json
+
+# Hermes Agent writes project-local state (.hermes/) into whatever workspace
+# it runs in — skills, attachments, per-project session data. Runtime state,
+# not source.
+**/.hermes/

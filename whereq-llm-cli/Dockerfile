@@ -47,10 +47,24 @@ ARG CLAUDE_CODE_VERSION=2.1.309
 ARG CODEX_VERSION=0.163.0
 ARG COPILOT_VERSION=1.0.103
 
+# ── Hermes Agent (Nous Research) ──
+# Hermes caps at Python <3.15 (pyproject: requires-python ">=3.11,<3.15") and
+# gates every direct dependency behind `python_version >= '3.14'`, because
+# 3.14 is the newest CPython its Rust-backed deps (pydantic-core) ship wheels
+# for. The shared /opt/python is 3.15, so Hermes gets its OWN 3.14
+# interpreter in a dedicated venv — installed into /opt/venvs/hermes, kept
+# OFF PATH so `python3` still means the shared 3.15 for everything else.
+ARG HERMES_VERSION=v0.22.5
+ARG HERMES_PYTHON_VERSION=3.14.9
+# The upstream commit the release tag points at. Baked into the install stamp
+# so `hermes --version` reports real provenance instead of "unknown".
+ARG HERMES_COMMIT=bf0203a794a07aac3ff764972ab9087baa4e4f4e
+
 # ── Feature switches: build a slim image by turning the big ones off ──
 ARG INSTALL_CLAUDE_CODE=1
 ARG INSTALL_CODEX=1
 ARG INSTALL_COPILOT=1
+ARG INSTALL_HERMES=1
 # Runtime user's uid/gid — the toolchains are handed over to it in the builder
 # so the runtime stage never has to copy files up just to change their owner.
 ARG USER_UID=1000
@@ -139,11 +153,61 @@ RUN --mount=type=cache,target=/tmp/uv-cache \
     if [ -n "${PYTHON_EXTRAS}" ]; then \
       /opt/uv/uv pip install --python /opt/python/bin/python3 ${PYTHON_EXTRAS}; \
     fi; \
-    rm -rf /tmp/requirements; \
-    # Hand the toolchains to the runtime user HERE, in the builder: the runtime
-    # stage COPYs them with their ownership intact, so no file ever has to be
-    # copied up into a second layer just to change its owner.
-    chown -R "${USER_UID}:${USER_GID}" /opt
+    rm -rf /tmp/requirements
+
+# ── Hermes Agent (Nous Research) ──
+# Installed from a source CHECKOUT, not a wheel. Upstream deliberately blocks
+# wheel/sdist builds outside Nix — setup.py raises unless HERMES_NIX_BUILD=1
+# — and publishes no prebuilt artifacts. An editable install (uv sync) is the
+# supported path, and it keeps the bundled assets (locales, skills,
+# optional-mcps, plugin manifests) that a wheel would silently drop.
+#
+# It gets its OWN CPython 3.14 at /opt/python314: Hermes pins requires-python
+# ">=3.11,<3.15" and gates every direct dependency behind
+# python_version >= '3.14', because 3.14 is the newest CPython its
+# Rust-backed deps (pydantic-core) ship wheels for. The venv at
+# /opt/hermes/.venv is deliberately NOT on PATH, so `python3` still means the
+# shared 3.15 for every other tool in this image.
+RUN --mount=type=cache,target=/tmp/uv-cache \
+    set -eux; \
+    mkdir -p /opt/python314 /opt/hermes; \
+    if [ "${INSTALL_HERMES}" != "1" ]; then \
+      echo "INSTALL_HERMES=${INSTALL_HERMES} — skipping Hermes Agent"; \
+      exit 0; \
+    fi; \
+    export UV_PYTHON_INSTALL_DIR=/opt/hermes/.uv-python; \
+    url="https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_BUILD}"; \
+    file="cpython-${HERMES_PYTHON_VERSION}+${PYTHON_BUILD}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"; \
+    curl -fsSLO "${url}/${file}"; \
+    tar -xzf "${file}" -C /opt/python314 --strip-components=1; \
+    rm -f "${file}"; \
+    /opt/python314/bin/python3 -VV; \
+    curl -fsSL "https://github.com/NousResearch/hermes-agent/archive/refs/tags/${HERMES_VERSION}.tar.gz" -o /tmp/hermes.tar.gz; \
+    tar -xzf /tmp/hermes.tar.gz -C /opt/hermes --strip-components=1; \
+    rm -f /tmp/hermes.tar.gz; \
+    cd /opt/hermes; \
+    /opt/uv/uv sync --frozen --python /opt/python314/bin/python3; \
+    rm -rf /opt/hermes/.uv-python; \
+    # Stamp the install: without it `hermes --version` reports "unknown" and
+    # the update steward cannot tell that a package manager owns this tree.
+    # The upstream image bakes the same "docker" marker into its install dir.
+    /opt/hermes/.venv/bin/python scripts/write_install_stamp.py \
+        --output /opt/hermes/install-stamp.json \
+        --commit "${HERMES_COMMIT}" \
+        --base-version "${HERMES_VERSION#v}" \
+        --distance 0 \
+        --source ci --distribution docker --update-mechanism external; \
+    printf 'docker' > /opt/hermes/.install_method; \
+    test -x /opt/hermes/.venv/bin/hermes; \
+    test -x /opt/hermes/.venv/bin/hermes-agent; \
+    test -x /opt/hermes/.venv/bin/hermes-acp; \
+    /opt/hermes/.venv/bin/hermes --version
+
+# ── Hand the toolchains to the runtime user HERE, in the builder ──
+# The runtime stage COPYs /opt with its ownership intact, so no file ever has
+# to be copied up into a second layer just to change its owner. A `chown -R
+# /opt` AFTER the COPY measured 6.4 GB in overlayfs — never reintroduce it.
+RUN chown -R "${USER_UID}:${USER_GID}" /opt
 
 # ─────────────────────────────── runtime ────────────────────────────────────
 FROM ubuntu:${UBUNTU_VERSION} AS runtime
@@ -190,6 +254,20 @@ COPY --from=builder /opt/node /opt/node
 COPY --from=builder /opt/npm /opt/npm
 COPY --from=builder /opt/python /opt/python
 COPY --from=builder /opt/uv/uv /opt/uv/uv
+# Hermes Agent: its own CPython 3.14 and the source checkout it runs from.
+# Both exist (possibly empty) even when INSTALL_HERMES=0, so the COPY never
+# breaks the build for a slim variant.
+COPY --from=builder /opt/python314 /opt/python314
+COPY --from=builder /opt/hermes /opt/hermes
+
+# Hermes console scripts on the global PATH. The venv's own bin/ stays OFF
+# PATH on purpose — putting it there would make `python3` resolve to Hermes'
+# 3.14 instead of the shared 3.15 that every other tool expects.
+RUN set -eux; \
+    for s in hermes hermes-agent hermes-acp; do \
+      [ -x "/opt/hermes/.venv/bin/${s}" ] || continue; \
+      ln -sf "/opt/hermes/.venv/bin/${s}" "/usr/local/bin/${s}"; \
+    done
 
 # `python3` / `python` / `pip` always point at the newest CPython, whatever
 # PYTHON_VERSION was configured.
@@ -234,13 +312,23 @@ RUN set -eux; \
 # ── Every CLI writes its state under /config, so one bind mount persists it ──
 RUN set -eux; \
     mkdir -p /config/providers /config/.config /config/.local/share \
-             /config/.local/state /config/.cache /config/.uv/python \
-             /config/.npm /workspace \
-             /config/claude /config/codex /config/copilot "/home/${USER_NAME}"; \
+             /config/.local/state /config/.local/bin /config/.cache \
+             /config/.uv/python /config/.npm /workspace \
+             /config/claude /config/codex /config/copilot /config/hermes \
+             "/home/${USER_NAME}"; \
     : > /config/gitconfig; \
     for d in claude codex copilot; do \
       ln -sfn "/config/${d}" "/home/${USER_NAME}/.${d}"; \
     done; \
+    # Hermes: HERMES_HOME points at /config/hermes (see ENV below), so the
+    # default profile's memories, skills, sessions, logs and cron jobs — and
+    # every named profile under profiles/ — live in the mounted volume. The
+    # ~/.hermes symlink covers the native-home fallback path.
+    ln -sfn /config/hermes "/home/${USER_NAME}/.hermes"; \
+    # Hermes writes a per-profile launcher wrapper into ~/.local/bin when a
+    # profile is created. Keep the whole .local tree in /config so those
+    # wrappers survive a container recreate.
+    ln -sfn /config/.local "/home/${USER_NAME}/.local"; \
     # /opt is already owned by the runtime user — the builder handed it over
     # before the COPY, so nothing here is copied up into a second layer.
     chown -R "${USER_UID}:${USER_GID}" /config /workspace "/home/${USER_NAME}"
@@ -253,7 +341,7 @@ ENV HOME=/home/${USER_NAME} \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     TZ=UTC \
-    PATH=/opt/node/bin:/opt/npm/bin:/opt/python/bin:/opt/uv:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PATH=/opt/node/bin:/opt/npm/bin:/opt/python/bin:/opt/uv:/config/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     XDG_CONFIG_HOME=/config/.config \
     XDG_DATA_HOME=/config/.local/share \
     XDG_STATE_HOME=/config/.local/state \
@@ -263,6 +351,7 @@ ENV HOME=/home/${USER_NAME} \
     npm_config_cache=/config/.npm \
     CLAUDE_CONFIG_DIR=/config/claude \
     CODEX_HOME=/config/codex \
+    HERMES_HOME=/config/hermes \
     NPM_CONFIG_UPDATE_NOTIFIER=false \
     NPM_CONFIG_FUND=false \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \

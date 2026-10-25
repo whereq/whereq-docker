@@ -1,8 +1,8 @@
 # whereq-llm-cli — a portable LLM CLI toolbox
 
-One container with Claude Code, Codex and Copilot, a full Node + Python
-toolchain, and the shell utilities they reach for — so a CLI can clone a repo,
-write a throwaway Python script, run it, and commit, without installing
+One container with Claude Code, Codex, Copilot and Hermes Agent, a full Node +
+Python toolchain, and the shell utilities they reach for — so a CLI can clone
+a repo, write a throwaway Python script, run it, and commit, without installing
 anything at runtime.
 
 | Component | Pinned version | Notes |
@@ -11,12 +11,13 @@ anything at runtime.
 | Claude Code | `@anthropic-ai/claude-code` 2.1.309 | Anthropic |
 | OpenAI Codex | `@openai/codex` 0.163.0 | OpenAI + OpenAI-compatible gateways |
 | GitHub Copilot CLI | `@github/copilot` 1.0.103 | needs a GitHub token |
+| Hermes Agent | `hermes-agent` v0.22.5 | Nous Research; brings its own CPython 3.14 |
 | Node.js | 24.22.1 LTS | + npm 11 |
 | CPython | 3.15.1 | python-build-standalone, i.e. the same interpreter `uv` manages |
-| Python libs | 75 pinned → 175 installed | numpy/pandas/scipy/sklearn/matplotlib, httpx/aiohttp, bs4/lxml, FastAPI/Flask, SQLAlchemy/psycopg, openai/anthropic, python-docx/pptx/pypdf, pytest/ruff/black/mypy |
+| Python libs | 70 pinned → 176 installed | numpy/pandas/scipy/sklearn/matplotlib, httpx/aiohttp, bs4/lxml, FastAPI/Flask, SQLAlchemy/psycopg, openai/anthropic, python-docx/pptx/pypdf, pytest/ruff/black/mypy |
 
 Gemini CLI, Qwen Code, opencode, Crush, Goose, aider and aichat were dropped to
-keep the image scoped to the three CLIs actually in use — resurrecting one means
+keep the image scoped to the CLIs actually in use — resurrecting one means
 rebuilding it from scratch (this directory is untracked in git, so there is no
 history to revert to). arm64 support was dropped at the same time; re-add
 `TARGETARCH`-based arch resolution in the Dockerfile if a host needs it again.
@@ -31,6 +32,9 @@ docker pull whereq/llm-cli:latest      # also tagged v1.0.0
 
 Digest `sha256:f0eb7c2b8d44…` — 14 layers, **1.28 GB compressed** / 4.91 GB
 uncompressed. The `v1.0.0` and `latest` tags point at the same image.
+
+> The published image predates the Hermes Agent integration — build locally
+> (`docker compose build`) to get Hermes, or wait for the next publish.
 
 Run it:
 
@@ -49,6 +53,7 @@ docker compose build
 docker compose run --rm llm-cli                  # interactive shell
 docker compose run --rm llm-cli claude          # Claude Code
 docker compose run --rm llm-cli codex "review this repo"
+docker compose run --rm llm-cli hermes          # → Hermes Agent
 docker compose run --rm llm-cli llm-doctor      # what is installed, is it wired up
 ```
 
@@ -128,13 +133,15 @@ CLI to read the code.
 /config/env                     ← optional single file you mount with your keys
 /config/providers/<name>.env    ← optional per-backend overrides
 /config/claude  codex  copilot
-/config/.config  .local/share  .local/state  .cache    ← XDG dirs
+/config/hermes                  ← ALL of Hermes' state (see below)
+/config/.config  .local/share  .local/state  .local/bin  .cache   ← XDG dirs
 ```
 
 The per-CLI dotdirs (`~/.claude`, `~/.codex`, …) are symlinks into `/config`,
-and `CLAUDE_CONFIG_DIR` / `CODEX_HOME` point at the same places, so Claude Code
-and Codex stay in the mounted volume however they look up their config. The
-XDG vars are redirected too, for anything that only honours those.
+and `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `HERMES_HOME` point at the same
+places, so Claude Code, Codex and Hermes stay in the mounted volume however
+they look up their config. The XDG vars are redirected too, for anything that
+only honours those.
 
 Mount only what you need to share:
 
@@ -142,6 +149,79 @@ Mount only what you need to share:
 -v ./llm-keys.env:/config/env:ro                     # all keys in one file
 -v ./deepseek.env:/config/providers/deepseek.env:ro  # one backend override
 -v ./agent-memory:/config/claude:/config/claude      # just Claude's history
+```
+
+## Hermes Agent
+
+Hermes (Nous Research) ships with the image and gets its own CPython 3.14 at
+`/opt/python314` — upstream caps it at `<3.15` because 3.14 is the newest
+CPython its Rust-backed dependencies ship wheels for. The shared `python3`
+stays 3.15; only Hermes uses 3.14.
+
+```bash
+docker compose run --rm llm-cli hermes                       # interactive
+docker compose run --rm llm-cli hermes-agent "summarise this repo"  # batch
+docker compose run --rm llm-cli hermes-acp                    # editor adapter
+```
+
+### Where Hermes keeps its state
+
+Everything lives under **`HERMES_HOME=/config/hermes`**, so it is all in the
+mounted volume and survives a container recreate:
+
+```
+/config/hermes/
+├── config.yaml          ← profile configuration
+├── .env                 ← profile secrets
+├── state.db             ← session/memory database
+├── memories/            ← MEMORY.md, USER.md — the agent's long-term memory
+├── skills/              ← skills for the default profile
+├── sessions/  logs/  cron/  cache/  hooks/
+├── active_profile       ← which profile is selected
+└── profiles/<name>/     ← one directory per named profile, same layout
+```
+
+A **profile** is a full parallel identity — its own config, `.env`, memories,
+skills, sessions and workspace:
+
+```bash
+docker compose run --rm llm-cli hermes profile create work
+docker compose run --rm llm-cli hermes profile list
+docker compose run --rm llm-cli hermes -p work          # use it
+docker compose run --rm llm-cli work                     # or the wrapper
+```
+
+Creating a profile also drops a launcher shim into `~/.local/bin`. The whole
+`~/.local` tree is symlinked to `/config/.local` and `/config/.local/bin` is on
+`PATH`, so those wrappers persist and are directly runnable.
+
+### Skills
+
+Skills are plain directories with a `SKILL.md`. They are read from three
+places, in precedence order:
+
+1. the active profile's `skills/` (where the agent writes new ones)
+2. `skills.external_dirs` in `config.yaml` — extra read-only directories,
+   `~`/`${VAR}`-expanded and resolved relative to `HERMES_HOME`
+3. project-local skills under `<workspace>/.hermes/skills/`
+
+```bash
+# point at a shared team skills directory
+docker compose run --rm llm-cli hermes config set skills.external_dirs '["/config/hermes/shared-skills"]'
+docker compose run --rm llm-cli hermes skills list
+docker compose run --rm llm-cli hermes skills search "deploy"
+```
+
+### Backends
+
+Hermes reads the same `ANTHROPIC_*` / `OPENAI_*` / `GEMINI_*` variables the
+other CLIs use, so `LLM_PROVIDER` selects the backend for it too. Two extras
+are mapped for Hermes: `WQ_MODEL` becomes `HERMES_MODEL`, and for the `ollama`
+provider `OLLAMA_HOST` is set (with the `/v1` suffix stripped) so Hermes does
+its own model discovery against the local Ollama.
+
+```bash
+LLM_PROVIDER=ollama docker compose run --rm llm-cli hermes
 ```
 
 ## Switching backends
@@ -202,14 +282,19 @@ and check `docker images` for the current number — the remaining weight is:
 
 | Part | What it is |
 |---|---|
+| `/opt/hermes` | Hermes Agent source checkout + its venv (~420 MB) |
 | `/opt/npm` | Claude Code, Codex, Copilot and their native binaries |
 | `/opt/python` | CPython 3.15 + the 176-package stack |
+| `/opt/python314` | CPython 3.14, for Hermes only (111 MB) |
 | `/usr` | apt toolbox, gcc, ffmpeg, ImageMagick |
 | `/opt/node` | Node 24 LTS |
+
+The image is **5.65 GB** with Hermes, 4.91 GB without.
 
 Trim it further with build args — measured savings:
 
 ```bash
+--build-arg INSTALL_HERMES=0         # −740 MB (drops Hermes Agent and its CPython 3.14)
 --build-arg INSTALL_BUILD_TOOLS=0   # −380 MB (drops gcc; pip installs of sdists stop working)
 --build-arg INSTALL_MEDIA=0         # −200 MB (drops ffmpeg + ImageMagick)
 --build-arg INSTALL_CODEX=0         # −410 MB
@@ -286,6 +371,12 @@ mounted from another uid are usable.
   `huggingface-hub<2`, which would force the LLM SDKs a major version back.
   Add it explicitly if you want its unified interface:
   `--build-arg PYTHON_EXTRAS=litellm`.
+- **Hermes is installed from source, not a wheel.** Upstream blocks wheel and
+  sdist builds outside Nix (`setup.py` raises unless `HERMES_NIX_BUILD=1`) and
+  publishes no prebuilt artifacts, so the build does an editable install with
+  `uv sync --frozen` against the shipped `uv.lock`. A wheel would also drop
+  the bundled assets (locales, skills, optional-mcps, plugin manifests) that
+  Hermes resolves from its install directory.
 - **`/opt` is owned by the runtime user**, so `pip install …`, `uv pip install
   --system …` and `npm i -g` all work inside a running container. Those changes
   die with the container — rebuild to make them permanent.
@@ -301,6 +392,6 @@ mounted from another uid are usable.
 - `docker-entrypoint.sh` → `/usr/local/bin/llm-entrypoint`
 - `llm-doctor.sh` → `/usr/local/bin/llm-doctor`
 - `dedupe-binaries.sh` — replaces the CLIs' duplicated native binaries with symlinks
-- `requirements/python-base.txt` — pinned Python stack
+- `requirements/python-base.txt` — pinned Python stack (the shared CPython)
 - `providers/*.env` — backend profiles (`LLM_PROVIDER=<basename>`)
 - `docker-compose.yml`, `.env.example`

@@ -34,7 +34,7 @@ printf '  %-14s %s\n' "pip"      "$(python3 -m pip --version 2>/dev/null | cut -
 
 section "llm clis"
 missing=0
-for cli in claude codex copilot; do
+for cli in claude codex copilot hermes; do
   if have "$cli"; then
     printf '  %s%-14s%s %s\n' "$G" "$cli" "$N" "$(version_of "$cli")"
   else
@@ -86,8 +86,25 @@ if [ -n "${GITHUB_TOKEN:-}${GH_TOKEN:-}" ]; then
   printf '  %-14s %sset (Copilot CLI)%s\n' "github" "$G" "$N"
 fi
 
+# Hermes keeps its own Python (3.14) beside the shared one, and its state in
+# HERMES_HOME rather than under a dotdir.
+if have hermes; then
+  section "hermes"
+  printf '  %-14s %s\n' "home"      "${HERMES_HOME:-<unset>}"
+  printf '  %-14s %s\n' "python"    "$(/opt/hermes/.venv/bin/python3 -V 2>/dev/null || echo '<missing>')"
+  printf '  %-14s %s\n' "install"   "$(/opt/hermes/.venv/bin/hermes --version 2>/dev/null | sed -n 's/^Install directory: //p' || echo '<unknown>')"
+  printf '  %-14s %s\n' "model"     "${HERMES_MODEL:-<default>}"
+  printf '  %-14s %s\n' "ollama"    "${OLLAMA_HOST:-<none>}"
+  if [ -d "${HERMES_HOME:-/nonexistent}" ]; then
+    printf '  %-14s %s\n' "profiles"  "$(ls -1 "${HERMES_HOME}/profiles" 2>/dev/null | wc -l) named"
+    printf '  %-14s %s\n' "skills"    "$(ls -1 "${HERMES_HOME}/skills" 2>/dev/null | wc -l) bundled"
+  else
+    printf '  %-14s %s%s not created yet%s\n' "state" "$Y" "$N"
+  fi
+fi
+
 section "cli config dirs (all under /config)"
-for d in claude codex copilot; do
+for d in claude codex copilot hermes; do
   [ -e "/config/$d" ] && printf '  /config/%-9s %s\n' "$d" "$(ls -A "/config/$d" 2>/dev/null | wc -l) entries"
 done
 

@@ -144,12 +144,16 @@ container filesystem. Hermes is the exception that proves the rule: it keeps
 (`/config/hermes`) rather than a scatter of dotdirs.
 
 **Entrypoint has three strict phases, in order** (`docker-entrypoint.sh`):
-1. **Drop privileges.** Runs as root only to `chown` bind mounts that are still
-   root-owned (never a directory already owned by someone else — that would
-   silently change ownership on the host side) then `exec setpriv --reuid …`
-   into the `llm` user. This must happen *before* step 2 — dropping privileges
-   re-execs the script, so loading config first would print every log line
-   twice.
+1. **Drop privileges.** Runs as root only to adopt the mounts, then `exec
+   setpriv --reuid …` into the `llm` user. This must happen *before* step 2 —
+   dropping privileges re-execs the script, so loading config first would
+   print every log line twice. `/config` is adopted **recursively but only
+   what is still root's** (`chown -R --from=0:0`): never a file that already
+   belongs to someone else, because that would silently change ownership on
+   the host side. The recursion is load-bearing — a volume an earlier
+   root-running container created holds root-owned files *inside*, and Hermes
+   refuses to start when its install state is not writable by the runtime
+   user. `/workspace` is only ever adopted at the top level, same reason.
 2. **Fan out credentials.** Loads `/config/env`, then the provider profile
    (`/config/providers/<name>.env` shadows `/etc/llm/providers/<name>.env`),
    then maps one canonical triple — `WQ_API_KEY` / `WQ_BASE_URL` / `WQ_MODEL` —

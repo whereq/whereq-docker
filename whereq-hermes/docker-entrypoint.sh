@@ -33,15 +33,26 @@ if [ "$(id -u)" = "0" ]; then
   # Started as root: adopt the mounted volumes for the runtime user, then drop
   # privileges.
   #
-  # Only when the directory is still root-owned — a fresh named volume, or one
-  # docker just created. A directory that already belongs to somebody else is
-  # left alone: chowning it would silently change ownership OUTSIDE the
-  # container (a host project owned by your desktop uid, say).
-  for d in /config "$HERMES_HOME" /workspace; do
-    if [ "$(stat -c %u "$d" 2>/dev/null || echo 0)" = "0" ]; then
-      chown "${TARGET_UID}:${TARGET_GID}" "$d" 2>/dev/null || true
-    fi
-  done
+  # /config is container-managed state, so everything in it that is still
+  # root's is adopted, at any depth. `--from=0` leaves files that already
+  # belong to somebody else alone. The recursion matters: a volume that an
+  # earlier root-running container created holds root-owned files inside, and
+  # Hermes refuses to start when its install state is not writable by the
+  # runtime user.
+  chown -R --from=0:0 "${TARGET_UID}:${TARGET_GID}" /config 2>/dev/null || true
+  # HERMES_HOME normally lives inside /config; if it was pointed elsewhere,
+  # adopt that tree too.
+  if [ "$HERMES_HOME" != "/config/hermes" ] && [ -d "$HERMES_HOME" ]; then
+    chown -R --from=0:0 "${TARGET_UID}:${TARGET_GID}" "$HERMES_HOME" 2>/dev/null || true
+  fi
+  # /workspace is a bind mount of the user's own project — only the top-level
+  # directory is adopted, and only when it is still root-owned. A directory
+  # that already belongs to somebody else is left alone: chowning it would
+  # silently change ownership OUTSIDE the container (a host project owned by
+  # your desktop uid, say).
+  if [ "$(stat -c %u /workspace 2>/dev/null || echo 0)" = "0" ]; then
+    chown "${TARGET_UID}:${TARGET_GID}" /workspace 2>/dev/null || true
+  fi
   exec setpriv --reuid "$TARGET_UID" --regid "$TARGET_GID" --clear-groups -- \
     /usr/local/bin/hermes-entrypoint "${@}"
 fi

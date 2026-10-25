@@ -30,7 +30,7 @@ Public on Docker Hub, `linux/amd64` only:
 docker pull whereq/llm-cli:latest      # also tagged v1.1.0
 ```
 
-Digest `sha256:b5c44b4c3af9…` — 17 layers, **1.45 GB compressed** / 5.65 GB
+Digest `sha256:b1564d9180b1…` — 17 layers, **1.45 GB compressed** / 5.65 GB
 uncompressed. The `v1.1.0` and `latest` tags point at the same image.
 
 `v1.1.0` is the Hermes Agent release; `v1.0.0` is the pre-Hermes image
@@ -104,9 +104,11 @@ Two scopes of `CLAUDE.md`, both persistent:
 | Project (per repo) | `/workspace/CLAUDE.md` | your host directory |
 | User (all projects) | `/config/claude/CLAUDE.md` | the `llm_config` volume |
 
-Writes need the container user to own the project. The entrypoint adopts a
-directory only when it is still root-owned (a fresh named volume, or one Docker
-just created) — it never chowns a host directory that already belongs to you.
+Writes need the container user to own the project. The entrypoint adopts
+`/workspace` only when it is still root-owned (a fresh named volume, or one
+Docker just created) — it never chowns a host directory that already belongs
+to you. (`/config`, the container's own state, is adopted recursively, but
+only for files still owned by root.)
 When your project belongs to a different uid the container prints exactly how to
 fix it, either per run:
 

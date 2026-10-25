@@ -31,7 +31,7 @@ Public on Docker Hub, `linux/amd64`:
 docker pull whereq/hermes-agent:latest      # also tagged v1.0.0
 ```
 
-Digest `sha256:8c73cd9732db…` — 11 layers, **0.21 GB compressed** / 895 MB
+Digest `sha256:d5773fc801f2…` — 11 layers, **0.21 GB compressed** / 895 MB
 uncompressed.
 
 ## Quick start
@@ -181,10 +181,15 @@ The container runs as a non-root `hermes` user (uid 1000). It starts as root,
 adopts the mounted volumes, then drops privileges with `setpriv` — `tini` stays
 PID 1 so the process trees Hermes spawns get reaped.
 
-A directory is only adopted when it is **still root-owned** (a fresh named
-volume, or one Docker just created). A directory that already belongs to
-somebody else is left alone: chowning it would silently change ownership on
-the *host* side.
+`/config` is adopted **recursively, but only what is still root's**
+(`chown -R --from=0:0`). A file that already belongs to somebody else is
+never touched — chowning it would silently change ownership on the *host*
+side. The recursion matters: a volume that an earlier root-running container
+created holds root-owned files *inside*, and Hermes refuses to start when its
+install state is not writable by the runtime user.
+
+`/workspace` is only ever adopted at the top level, and only when it is
+still root-owned — it is a bind mount of your own project.
 
 If your host uid is not 1000, set it in `.env` and rebuild — the uid is a
 build arg, so the volumes get the right ownership:

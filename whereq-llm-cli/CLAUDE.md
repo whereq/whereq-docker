@@ -201,8 +201,14 @@ install dir, model, profile and skill counts) when `hermes` is on `PATH`.
   `apps/` and `contributors/` look prunable, but runtime modules reference
   them (`agent/coding_context.py`, `hermes_cli/source_build.py`) to detect a
   source checkout and resolve assets.
-- The standalone `whereq-hermes` image is pinned to `v2026.6.5` (Hermes
-  `v0.16.0`) on Python 3.13 and is now **out of date and broken** against
-  current upstream: its `uv build --wheel` step trips the wheel-build guard
-  described above. It needs the same source-checkout treatment (and Python
-  3.14) before it can be rebuilt.
+- The standalone `whereq-hermes` image now runs the **same** Hermes release
+  (`v0.22.5`, upstream commit `bf0203a7`) on the same CPython 3.14.9, with
+  the same source-checkout install. Keep `HERMES_VERSION`, `HERMES_COMMIT` and
+  `HERMES_PYTHON_VERSION` in step between the two images.
+- **Project-local skills need an explicit trust.** A repo's
+  `<root>/.hermes/skills/` is a code-execution surface, so upstream only loads
+  it for roots listed in `skills.trusted_project_dirs` — set with
+  `hermes skills trust <root>`. The setting lives in `config.yaml` and
+  persists in the mounted volume. `hermes skills list` shows only *installed*
+  skills; project skills are reported by the trust command and load into
+  sessions.

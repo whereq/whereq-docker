@@ -1,12 +1,31 @@
+# =============================================================================
+# whereq-hermes — Hermes Agent (Nous Research) as a container
+# =============================================================================
+#   cp .env.example .env      # set WQ_API_KEY (and LLM_PROVIDER)
+#   docker compose build
+#   docker compose run --rm hermes                              # → interactive
+#   docker compose run --rm hermes hermes-agent "summarise this repo"
+#
+# .env is read by compose for ${VAR} substitution — it is not baked into the
+# image, and it is gitignored.
+# =============================================================================
 services:
   hermes:
     build:
       context: .
       dockerfile: Dockerfile
-      # Pin or override the Hermes version / UID here.
       args:
-        HERMES_VERSION: v2026.6.5
-        HERMES_UID: "10000"
+        # Keep these in step with whereq-llm-cli: the same Hermes release is
+        # bundled in both images.
+        HERMES_VERSION: "v0.22.5"
+        HERMES_COMMIT: "bf0203a794a07aac3ff764972ab9087baa4e4f4e"
+        HERMES_PYTHON_VERSION: "3.14.9"
+        UV_VERSION: "0.13.5"
+        # Match your host user so bind-mounted files stay writable. Set these
+        # in .env (not here) — changing them changes the build args, so
+        # compose rebuilds and the volumes get the right ownership.
+        HERMES_UID: "${HERMES_UID:-1000}"
+        HERMES_GID: "${HERMES_GID:-1000}"
     image: whereq/hermes-agent:latest
     container_name: hermes
     restart: unless-stopped
@@ -14,31 +33,52 @@ services:
     # override with: docker compose run --rm hermes hermes-agent "your prompt"
     stdin_open: true
     tty: true
+    working_dir: /workspace
+
     environment:
-      # API key for the model provider. Put your real key in a .env file
-      # and uncomment the `env_file` line below.
-      # OPENAI_API_KEY: ${OPENAI_API_KEY}
-      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-      TERM: xterm-256color
-    env_file:
-      - .env
+      # Provider selection + credentials. The entrypoint fans these out to
+      # ANTHROPIC_*/OPENAI_*/GEMINI_* and HERMES_MODEL.
+      LLM_PROVIDER: "${LLM_PROVIDER:-anthropic}"
+      WQ_API_KEY: "${WQ_API_KEY:-}"
+      WQ_MODEL: "${WQ_MODEL:-}"
+      TZ: "${TZ:-UTC}"
+      # Must match the build args above — the entrypoint drops privileges to
+      # this uid, and the mounted volumes are owned by it.
+      HERMES_UID: "${HERMES_UID:-1000}"
+      HERMES_GID: "${HERMES_GID:-1000}"
+      # Point Hermes at a local Ollama instead of a hosted API:
+      # OLLAMA_HOST: "http://ollama:11434"
+      # Or reach one on the host:
+      # OLLAMA_HOST: "http://host.docker.internal:11434"
+
     volumes:
-      # Persist Hermes home (sessions, memories, skills you author at runtime)
-      - hermes_home:/home/hermes/.hermes
-      # Mount the whereq-ollama sidecar's port as a model backend.
-      # Requires the `ollama` compose service to be on the same network
-      # (uncomment the `networks:` block below if running both stacks).
-      # - /var/run/docker.sock:/var/run/docker.sock  # only if you want
-      #   hermes to be able to spawn sibling containers via the docker CLI
+      # ALL of Hermes' state: the default profile's memories, skills,
+      # sessions, logs, cron jobs and state.db, plus one directory per named
+      # profile under profiles/.
+      - hermes_home:/config/hermes
+      # Per-profile launcher wrappers Hermes writes into ~/.local/bin.
+      - hermes_local:/config/.local
+      # Your project — this is Hermes' working directory, so the files it
+      # writes land here. Point it at your repo with WORKSPACE in .env, or
+      # override per run:  -v "$PWD":/workspace
+      - "${WORKSPACE:-./workspace}:/workspace"
+      # A single-file drop-in for credentials (Docker secrets style):
+      # - ./hermes-keys.env:/config/env:ro
+
+    # Lets OLLAMA_HOST reach an Ollama running on the host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # To talk to the whereq-ollama container directly instead of the host:
     # networks:
     #   - ollama_net
+    # networks:
+    #   ollama_net:
+    #     external: true
+    #     name: whereq-ollama_default   # the default network created by the
+    #                                  # whereq-ollama docker compose project
 
-# volumes:
-#   hermes_home:
-#     name: hermes_home
-
-# networks:
-#   ollama_net:
-#     external: true
-#     name: whereq-ollama_default   # the default network created by the
-#                                  # whereq-ollama docker compose project
+volumes:
+  hermes_home:
+    name: hermes_home
+  hermes_local:
+    name: hermes_local

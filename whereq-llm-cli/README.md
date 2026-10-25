@@ -27,14 +27,15 @@ history to revert to). arm64 support was dropped at the same time; re-add
 Public on Docker Hub, `linux/amd64` only:
 
 ```bash
-docker pull whereq/llm-cli:latest      # also tagged v1.0.0
+docker pull whereq/llm-cli:latest      # also tagged v1.1.0
 ```
 
-Digest `sha256:f0eb7c2b8d44…` — 14 layers, **1.28 GB compressed** / 4.91 GB
-uncompressed. The `v1.0.0` and `latest` tags point at the same image.
+Digest `sha256:b5c44b4c3af9…` — 17 layers, **1.45 GB compressed** / 5.65 GB
+uncompressed. The `v1.1.0` and `latest` tags point at the same image.
 
-> The published image predates the Hermes Agent integration — build locally
-> (`docker compose build`) to get Hermes, or wait for the next publish.
+`v1.1.0` is the Hermes Agent release; `v1.0.0` is the pre-Hermes image
+(4.91 GB) and stays available for anyone who wants the smaller footprint.
+`INSTALL_HERMES=0` still builds that smaller image locally.
 
 Run it:
 
@@ -204,6 +205,19 @@ places, in precedence order:
 2. `skills.external_dirs` in `config.yaml` — extra read-only directories,
    `~`/`${VAR}`-expanded and resolved relative to `HERMES_HOME`
 3. project-local skills under `<workspace>/.hermes/skills/`
+
+Project-local skills need the project **trusted** first — a repo's skills are
+a code-execution surface, so upstream requires an explicit opt-in per root:
+
+```bash
+docker compose run --rm llm-cli hermes skills trust /workspace
+# → Trusted: /workspace
+#   1 project skill(s) will load in sessions started inside this repo
+```
+
+The trust lands in `config.yaml` (`skills.trusted_project_dirs`) and persists
+in the mounted volume. `hermes skills list` shows only *installed* skills;
+project skills are reported by the trust command and load into sessions.
 
 ```bash
 # point at a shared team skills directory

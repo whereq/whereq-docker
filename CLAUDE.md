@@ -66,6 +66,7 @@ Verification is manual and out-of-band: build the image and run the container. T
 - `tini` is PID 1 (these CLIs spawn process trees: MCP servers, shells, git) and `setpriv` does the privilege drop.
 - `litellm` is deliberately absent from the base Python stack: it pins `openai<3` and `huggingface-hub<2`, which would drag the LLM SDKs a major version back. Add it via `--build-arg PYTHON_EXTRAS=litellm`.
 - `.dockerignore` is an allowlist (`*` plus explicit `!` entries) so the build context stays tiny.
+- The image is **published publicly on Docker Hub** as `whereq/llm-cli:latest` and `whereq/llm-cli:v1.0.0` (same image, digest `sha256:f0eb7c2b8d44…`, 1.28 GB compressed / 4.91 GB uncompressed, `linux/amd64` only). `docker pull` it rather than building, when the local build is not needed.
 
 The entrypoint fans one canonical triple (`WQ_API_KEY` / `WQ_BASE_URL` / `WQ_MODEL`) onto each CLI's own env var names, loading a profile from `/etc/llm/providers/<name>.env` (shadowed by `/config/providers/`). DeepSeek and MiniMax speak Anthropic's protocol on a *different* path than their OpenAI-compatible one, so their profiles also set `WQ_ANTHROPIC_BASE_URL`, which only affects `ANTHROPIC_BASE_URL`. All state lives under `/config`; `/workspace` is the code and the CLI's working directory.
 

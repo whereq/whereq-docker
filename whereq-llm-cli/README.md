@@ -21,6 +21,26 @@ rebuilding it from scratch (this directory is untracked in git, so there is no
 history to revert to). arm64 support was dropped at the same time; re-add
 `TARGETARCH`-based arch resolution in the Dockerfile if a host needs it again.
 
+## Published image
+
+Public on Docker Hub, `linux/amd64` only:
+
+```bash
+docker pull whereq/llm-cli:latest      # also tagged v1.0.0
+```
+
+Digest `sha256:f0eb7c2b8d44…` — 14 layers, **1.28 GB compressed** / 4.91 GB
+uncompressed. The `v1.0.0` and `latest` tags point at the same image.
+
+Run it:
+
+```bash
+docker run --rm -it \
+  -v llm-config:/config -v "$PWD":/workspace \
+  -e LLM_PROVIDER=anthropic -e WQ_API_KEY=sk-ant-… \
+  whereq/llm-cli:latest claude
+```
+
 ## Quick start
 
 ```bash

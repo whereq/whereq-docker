@@ -42,7 +42,7 @@ Verification is manual and out-of-band: build the image and run the container. T
 
 ## Images and their non-obvious constraints
 
-**whereq-db** — shared PostgreSQL 17 + PostGIS 3.5 + pgvector 0.8.0 cluster serving multiple apps. The base image choice (`imresamu/postgis:17-3.5-alpine`, not official `postgres` + apk postgis) is load-bearing: the official Alpine postgres lives in `/usr/local` so Alpine's apk postgis package never links against it, the Alpine postgres uid (70) matches the existing host data dir, and the PROD host is arm64 which `postgis/postgis` doesn't publish. pgvector is likewise built **from source** in the Dockerfile, for the same prefix reason (the Alpine apk build targets a different PostgreSQL) — but the extension is only *available*, not enabled cluster-wide; `CREATE EXTENSION vector` belongs in each app's own migrations, same as PostGIS. `init.sql` runs only against a fresh/empty data directory (cluster-wide extensions only). Data is on a host bind mount, so rebuilds never lose data.
+**whereq-db** — shared PostgreSQL 17 + PostGIS 3.5 + pgvector 0.8.0 cluster serving multiple apps. The base image choice (`imresamu/postgis:17-3.5-alpine`, not official `postgres` + apk postgis) is load-bearing: the official Alpine postgres lives in `/usr/local` so Alpine's apk postgis package never links against it, the Alpine postgres uid (70) matches the existing host data dir, and `postgis/postgis` publishes no arm64 build (the PROD host itself is amd64 — verified 2026-10-26). pgvector is likewise built **from source** in the Dockerfile, for the same prefix reason (the Alpine apk build targets a different PostgreSQL) — but the extension is only *available*, not enabled cluster-wide; `CREATE EXTENSION vector` belongs in each app's own migrations, same as PostGIS. `init.sql` runs only against a fresh/empty data directory (cluster-wide extensions only). Data is on a host bind mount, so rebuilds never lose data.
 
 **whereq-db has two overlapping control surfaces.** `bin/whereq-db` is the canonical cross-app lifecycle (local + prod, one script). The image directory also carries PROD-compose-oriented per-directory scripts — `whereq-db/build.sh`, `backup.sh`, `restart.sh`, `status.sh` and `docker-compose-prod.yml` — which operate on the PROD compose file. Both read the same `whereq-db/.env`, but with **different variable names**: `bin/whereq-db` uses `WHEREQ_DB_*` (image/container/network/port/data) plus `POSTGRES_USER|DB|PASSWORD`, while `docker-compose-prod.yml` uses `POSTGRES_*` plus `DB_PORT` and `POSTGRES_DATA_PATH`. `whereq-db/.env.example` therefore lists the union — keep `WHEREQ_DB_PORT`/`DB_PORT` and `WHEREQ_DB_DATA`/`POSTGRES_DATA_PATH` in step.
 
@@ -79,6 +79,28 @@ The entrypoint fans one canonical triple (`WQ_API_KEY` / `WQ_BASE_URL` / `WQ_MOD
 
 The hermes and ollama stacks are separate compose projects. To let Hermes use the local Ollama, uncomment the `networks:` block in `whereq-hermes/docker-compose.yml` (it joins the external `whereq-ollama_default` network) and set `OLLAMA_HOST: http://ollama:11434`.
 
+## The PROD host
+
+PROD is **one** host: the "mini server", hostname **`whereq`**, LAN IP `192.168.0.196`, Ubuntu 24.04 (kernel 7.0), **amd64**. It runs the shared `whereq-db`, every WhereQ app's container, and both Cloudflare tunnel connectors.
+
+**How to reach it:**
+
+```bash
+ssh whereq@whereq        # at home (LAN)
+ssh ssh.whereq.cc        # from anywhere else
+```
+
+`ssh.whereq.cc` is the *same* machine — a Cloudflare **Access** SSH endpoint (Public Hostname `ssh.whereq.cc` → `ssh://localhost:22` on the whereq-family tunnel). The local `~/.ssh/config` reaches it via `ProxyCommand cloudflared access ssh --hostname %h`, so the **workstation's own `cloudflared` binary is on the critical path for remote access** and must stay current (see the tunnel section).
+
+**Root on PROD without the sudo password.** The `whereq` user is in the `docker` group — root-equivalent on the host — and `sudo` there needs a password (no NOPASSWD rule). For root work:
+
+```bash
+ssh whereq@whereq 'docker run --rm --privileged --pid=host -v /:/host alpine:3.20 \
+  nsenter -t 1 -m -u -i -n -p -- /bin/sh -c "apt-get install --only-upgrade -y <pkg>"'
+```
+
+`nsenter -t 1` joins PID 1's namespaces, so apt/systemd act on the *host*. Three gotchas: (1) the container's own mounts are discarded by `nsenter -m` — put helper scripts on the host filesystem first and invoke them by host path; (2) `systemctl` over that path is **denied by polkit** ("requires interactive authentication") because the caller is in no logind session — but `apt` works, and a `dpkg` upgrade of a unit that is running restarts it by itself (postinst `try-restart`), which is how the `cloudflared` upgrade was applied; (3) `kill` on a root process needs the same wrapper, since a plain `ssh` session runs as `whereq`.
+
 ## Cloudflare tunnels (PROD)
 
 `cloudflare/README.md` is the infra design doc for how the WhereQ Universe exposes services on the PROD host ("mini server") via Cloudflare Tunnels — not part of the Docker build, but read it before changing anything tunnel- or ingress-related. Key facts it establishes:
@@ -87,7 +109,25 @@ The hermes and ollama stacks are separate compose projects. To let Hermes use th
 - Ingress (hostname → service) is configured entirely in each account's **Cloudflare Zero Trust dashboard** — there is no local `config.yml` and no tunnel ID/token committed to this repo.
 - To expose a new whereq-family app: publish a host port on its frontend (the `808x` convention, next free is **8084** per the port registry at the bottom of the doc), add a Public Hostname in the whereq dashboard pointing at `http://localhost:<port>`, and register the URL with Keycloak (realm `flowdesk.top`, client `flowdesk-spa`) if it's an SPA.
 
-**Architecture constraints on the PROD host.** The PROD mini server is **arm64**. `whereq-llm-cli` is **amd64-only** (no `TARGETARCH` resolution in its Dockerfile), so it cannot run on PROD as it stands — re-add arch resolution there first if that changes. `whereq-db`'s base image choice (`imresamu/postgis:17-3.5-alpine`) is likewise arm64-driven, because `postgis/postgis` publishes no arm64 build.
+### Upgrading the connectors
+
+Every connector runs `cloudflared --no-autoupdate`, so **none of them update themselves** — an upgrade is a deliberate act, and the advisory threshold (≥ **2026.10.2**, for the compromised eMudhra/emSign intermediates) has to be checked by hand.
+
+| Connector | Where | Installed as | How to upgrade |
+|---|---|---|---|
+| whereq-family | `cloudflared.service` (host systemd) | apt, `pkg.cloudflare.com` | `apt-get install --only-upgrade cloudflared` — dpkg's postinst restarts the unit by itself. Verify: `/usr/bin/cloudflared --version`, then `journalctl -u cloudflared \| grep "Registered tunnel connection"` (expect 4) |
+| ccbus | `cloudflared-ccbus`, inside `~/git/ccbus.cc-backend/docker/docker-compose.prod.yml` | docker image | pin `image: cloudflare/cloudflared:<version>` in that compose file, then `cd docker && docker compose --env-file ../.env -f docker-compose.prod.yml pull cloudflared && … up -d cloudflared` |
+| Access SSH client | the **workstation's** `/usr/local/bin/cloudflared` | manual binary | download `cloudflared-linux-amd64` from the GitHub release, check its SHA256 against the release notes, then overwrite the binary **in place** (it is user-owned; `/usr/local/bin` itself is not writable) |
+
+All three are on **2026.10.4** (upgraded 2026-10-26, from 2026.8.2 / 2026.7.3 / 2026.3.0).
+
+Traps worth remembering:
+
+- `docker compose up -d cloudflared` in the buzz stack also **recreates `buzz-api`** (it is a `depends_on` of the connector) — expect a few seconds of `buzz.ccbus.cc` downtime.
+- The ccbus connector passes its token as `--token` **on the command line**, so it is readable in `ps` by every local user. The whereq-family unit uses `--token-file /etc/cloudflared/token` — prefer that pattern when touching either connector.
+- `api.ccbus.cc` is **not** this tunnel. It resolves to a Vultr host (216.198.79.1) that serves its own Let's Encrypt cert, which **expired 2026-09-16**; the ccbus tunnel only fronts `buzz.ccbus.cc`.
+
+**Architecture constraints on the PROD host.** The PROD mini server is **amd64** (verified on the host 2026-10-26: `uname -m` → `x86_64`, `dpkg --print-architecture` → `amd64`; the repo previously claimed arm64, which was never checked). So the amd64-only `whereq-llm-cli` image *does* run on PROD as it stands, and the official `postgis/postgis` image would work there too. `whereq-db` still uses `imresamu/postgis:17-3.5-alpine` — but for the reasons that survive on an amd64 host: the official Alpine postgres lives in `/usr/local` so apk's postgis package never links against it, and the Alpine postgres uid (70) matches the existing host data dir.
 
 ## Repo state
 

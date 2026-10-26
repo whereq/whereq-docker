@@ -81,5 +81,5 @@ cluster bootstrap `init.sql`.
 ## Why this base image
 
 See the top of `Dockerfile` — `imresamu/postgis:17-3.5-alpine` is load-bearing
-(correct PostGIS linkage, matching uid for the host data dir, arm64 for the PROD
-Raspberry Pi).
+(correct PostGIS linkage, matching uid for the host data dir, and
+`postgis/postgis` publishes no arm64 build — the PROD host itself is amd64).

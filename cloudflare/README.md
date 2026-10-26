@@ -2,7 +2,9 @@
 
 Infrastructure design + implementation reference for how the WhereQ Universe
 exposes services to the internet via **Cloudflare Tunnels** on the PROD host
-(the "mini server": hostname `whereq`, `192.168.0.199`, `ssh whereq@whereq`).
+(the "mini server": hostname `whereq`, `192.168.0.196`, `ssh whereq@whereq` from
+home / `ssh ssh.whereq.cc` from anywhere — the latter is the same machine reached
+through the tunnel's own Cloudflare Access SSH endpoint).
 
 > **TL;DR** — Two Cloudflare **accounts**, one **tunnel** each, so two connector
 > processes (irreducible). The *whereq family* tunnel runs as a **host systemd
@@ -57,13 +59,16 @@ RestartSec=5s
 - Token file: `/etc/cloudflared/token` (`root:root`, `0600`).
 - Fronts the whereq family (flowdesk.top, catobigato, chroniq, whereq-*, and the
   new whereq-monitor) — each via `http://localhost:<port>` (see port registry).
+- Installed by **apt** from `pkg.cloudflare.com`; unit is
+  `Type=notify` + `Restart=on-failure`, so a package upgrade restarts it by
+  itself (dpkg's postinst `try-restart`).
 
 ### ccbus tunnel — Docker container (ccbus account)
 
 ```yaml
 # ~/git/ccbus.cc-backend/docker/docker-compose.prod.yml
 cloudflared:
-  image: cloudflare/cloudflared:latest
+  image: cloudflare/cloudflared:2026.10.4   # pinned, not `latest`
   container_name: cloudflared-ccbus
   command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
   depends_on: [api]            # ← lifecycle-tied to buzz-api
@@ -71,7 +76,8 @@ cloudflared:
 ```
 
 - Token comes from `${CLOUDFLARE_TUNNEL_TOKEN}` (buzz repo env; never committed).
-- Fronts only `buzz-api` today, routed as `http://buzz-api:8000` (container name).
+- Fronts only `buzz-api` today, routed as `http://buzz-api:8000` (container name);
+  its public hostname is **`buzz.ccbus.cc`**.
 - The connector is **owned by the buzz-api stack** (buried in its compose,
   `depends_on: api`).
 
@@ -80,6 +86,62 @@ cloudflared:
 Account tag + tunnel ID are encoded in each token. **Not committed here** — they
 live in the respective Cloudflare account dashboard (whereq / ccbus) and in the
 token file / buzz env. The `secret` field is a credential; never log or commit it.
+
+### Upgrading the connectors
+
+All three connectors run `cloudflared --no-autoupdate`, so **none of them updates
+itself** — an upgrade is a deliberate act, and a security advisory's minimum
+version has to be checked by hand.
+
+| Connector | Where | Installed as | Upgrade |
+|---|---|---|---|
+| whereq-family | `cloudflared.service` (host systemd) | apt, `pkg.cloudflare.com` | `apt-get install --only-upgrade cloudflared`; dpkg's postinst restarts the unit |
+| ccbus | `cloudflared-ccbus` (buzz compose) | docker image | pin the tag in the compose file, then `pull` + `up -d cloudflared` |
+| Access SSH client | the **workstation's** `/usr/local/bin/cloudflared` | manual binary | download the release binary, verify its SHA256 against the release notes, overwrite in place |
+
+> **2026-10-26 — emSign/eMudhra advisory.** Cloudflare's 2026-10-20 notice: eight
+> eMudhra intermediate certificates use weak private keys, and `cloudflared`
+> before **2026.10.2** still trusts them. All three instances were moved to
+> **2026.10.4** (from 2026.8.2 / 2026.7.3 / 2026.3.0). The whereq-family unit
+> restarted itself one second after the package landed; the ccbus container and
+> the local client were redeployed by hand. The 19 hostnames on the
+> whereq-family tunnel and `buzz.ccbus.cc` were re-checked afterwards — all
+> serve traffic.
+
+Verify after any upgrade:
+
+```bash
+# whereq-family connector
+/usr/bin/cloudflared --version
+journalctl -u cloudflared --since "-2min" | grep "Registered tunnel connection"   # expect 4
+systemctl show cloudflared -p MainPID -p ActiveEnterTimestamp
+
+# ccbus connector
+docker exec cloudflared-ccbus cloudflared --version
+docker logs cloudflared-ccbus 2>&1 | grep "Registered tunnel connection"
+```
+
+Two traps:
+
+- `docker compose up -d cloudflared` in the buzz stack also **recreates
+  `buzz-api`** (the connector `depends_on` it), so that container restarts too —
+  expect a few seconds of `buzz.ccbus.cc` downtime.
+- The ccbus connector passes its token as `--token` **on the command line**, so
+  it is readable in `ps` by any local user. The whereq-family unit uses
+  `--token-file /etc/cloudflared/token` — prefer that pattern.
+
+**Root on PROD without the sudo password.** The `whereq` user is in the `docker`
+group (root-equivalent) and `sudo` needs a password, so root work goes through
+a privileged container that joins PID 1's namespaces:
+
+```bash
+ssh whereq@whereq 'docker run --rm --privileged --pid=host -v /:/host alpine:3.20 \
+  nsenter -t 1 -m -u -i -n -p -- /bin/sh -c "apt-get install --only-upgrade -y cloudflared"'
+```
+
+`nsenter -m` discards the container's own mounts (put helper scripts on the host
+first), and `systemctl` over that path is **denied by polkit** — apt works, and
+a `dpkg` upgrade restarts the running unit by itself.
 
 ---
 

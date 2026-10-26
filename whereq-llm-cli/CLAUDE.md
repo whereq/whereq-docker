@@ -197,8 +197,9 @@ install dir, model, profile and skill counts) when `hermes` is on `PATH`.
 - Node and uv downloads are checksum-verified against the publisher's own
   checksum file; everything else comes over authenticated HTTPS only.
 - `amd64` only — no `TARGETARCH` resolution. The PROD "mini server" host
-  (see the repo-root CLAUDE.md's Cloudflare section) is arm64, so this image
-  currently cannot run there; re-add arch handling before deploying it to PROD.
+  (see the repo-root CLAUDE.md's Cloudflare section) is amd64 as well, so the
+  image runs there as it stands; add `TARGETARCH` resolution only if an arm64
+  host ever needs it.
 - The image is **5.65 GB** with Hermes, 4.91 GB without (`INSTALL_HERMES=0`).
   Hermes costs ~740 MB: a second CPython (111 MB) and the source checkout plus
   its venv (~420 MB). The checkout is kept whole on purpose — `tests/`,

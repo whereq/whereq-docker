@@ -398,9 +398,10 @@ mounted from another uid are usable.
   die with the container — rebuild to make them permanent.
 - **Checksums.** Node and uv downloads are verified against the publisher's
   checksum file; the rest come over authenticated HTTPS.
-- **Architecture.** `linux/amd64` only. arm64 support (needed for the PROD
-  mini-server host) was dropped along with the other CLIs — re-add
-  `TARGETARCH`-based arch resolution in the Dockerfile if that changes.
+- **Architecture.** `linux/amd64` only. arm64 support was dropped along with the
+  other CLIs — re-add `TARGETARCH`-based arch resolution in the Dockerfile if an
+  arm64 host ever needs it. (The PROD mini-server host is amd64, so this image
+  runs there as it stands.)
 
 ## Files
 
